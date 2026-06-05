@@ -33,6 +33,58 @@ def test_convert_endpoint_runs_mock_pipeline() -> None:
     assert data["script_yaml"]["script"]
 
 
+def test_single_chapter_multiple_scenes_bind_to_first_chapter() -> None:
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/convert",
+        json={
+            "title": "One Chapter",
+            "text": "Chapter 1 Opening\n\nAlice waits in the station.\n\nBob arrives with a locked case.",
+            "mock": True,
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    scenes = data["script_yaml"]["scenes"]
+
+    assert len(data["chapters"]) == 1
+    assert data["chapters"][0]["chapter_id"] == "chapter_1"
+    assert data["chapters"][0]["chapter_index"] == 1
+    assert len(scenes) >= 2
+    assert {scene["source_ref"]["chapter_id"] for scene in scenes} == {"chapter_1"}
+    assert {scene["source_ref"]["chapter_index"] for scene in scenes} == {1}
+
+
+def test_two_chapters_bind_scenes_to_real_source_chapters() -> None:
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/convert",
+        json={
+            "title": "Two Chapters",
+            "text": (
+                "Chapter 1 Opening\n\nAlice waits in the station.\n\n"
+                "Chapter 2 Return\n\nBob returns with a locked case."
+            ),
+            "mock": True,
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    scenes = data["script_yaml"]["scenes"]
+    first_chapter_scenes = [scene for scene in scenes if scene["source_ref"]["chapter_id"] == "chapter_1"]
+    second_chapter_scenes = [scene for scene in scenes if scene["source_ref"]["chapter_id"] == "chapter_2"]
+
+    assert [chapter["chapter_id"] for chapter in data["chapters"]] == ["chapter_1", "chapter_2"]
+    assert first_chapter_scenes
+    assert second_chapter_scenes
+    assert all(scene["source_ref"]["chapter_index"] == 1 for scene in first_chapter_scenes)
+    assert all(scene["source_ref"]["chapter_index"] == 2 for scene in second_chapter_scenes)
+
+
 def test_polish_scene_endpoint_updates_scriptyaml() -> None:
     client = TestClient(app)
     convert_response = client.post(
@@ -94,3 +146,37 @@ def test_project_optional_empty_strings_become_none() -> None:
     assert result.project.genre is None
     assert result.project.logline is None
     assert result.project.source == "source.txt"
+
+
+def test_scriptyaml_accepts_editable_script_line_fields() -> None:
+    data = {
+        "project": {"title": "Editable Lines"},
+        "characters": [{"id": "char_1", "name": "A"}],
+        "locations": [{"id": "loc_1", "name": "Room"}],
+        "scenes": [{"id": "scene_1", "title": "Open", "location_id": "loc_1", "characters": ["char_1"]}],
+        "script": [
+            {
+                "id": "line_1",
+                "scene_id": "scene_1",
+                "type": "camera",
+                "content": "Push in.",
+                "text": "Push in.",
+                "highlight_color": "#fff3a3",
+                "note": "Keep the frame tight.",
+            },
+            {
+                "id": "line_2",
+                "scene_id": "scene_1",
+                "type": "dialogue",
+                "content": "I am ready.",
+                "speaker_name": "Guest",
+                "emotion": "calm",
+            },
+        ],
+    }
+
+    result = ScriptYAML.model_validate(data)
+
+    assert result.script[0].type == "camera"
+    assert result.script[0].highlight_color == "#fff3a3"
+    assert result.script[1].speaker_name == "Guest"

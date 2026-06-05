@@ -6,7 +6,7 @@ from backend.schemas.script_yaml import ScriptYAML, ScriptLineType
 from backend.services.ai_client import LLMClient
 from backend.services.entity_extractor import ProjectData
 
-VALID_LINE_TYPES: set[str] = {"action", "dialogue", "transition", "note"}
+VALID_LINE_TYPES: set[str] = {"action", "dialogue", "transition", "note", "camera", "narration"}
 
 
 async def generate_script_yaml_data(project_data: ProjectData, *, client: LLMClient | None = None) -> ProjectData:
@@ -115,8 +115,8 @@ def _normalize_script_lines(lines: Any, data: ProjectData) -> list[dict[str, Any
 
 def _normalize_line_type(value: Any) -> ScriptLineType:
     line_type = str(value or "action").strip().lower()
-    if line_type in {"camera", "shot", "镜头", "镜头提示"}:
-        return "note"
+    if line_type in {"shot", "镜头", "镜头提示"}:
+        return "camera"
     if line_type not in VALID_LINE_TYPES:
         return "action"
     return line_type  # type: ignore[return-value]

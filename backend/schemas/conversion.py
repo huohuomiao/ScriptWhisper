@@ -14,6 +14,8 @@ class ConvertRequest(BaseModel):
 
 class ChapterResponse(BaseModel):
     id: str
+    chapter_id: str
+    chapter_index: int = Field(..., ge=1)
     title: str
     heading: str
     marker: str

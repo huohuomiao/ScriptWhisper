@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 from backend.services.ai_client import LLMClient
 from backend.services.entity_extractor import ProjectData
@@ -10,10 +10,12 @@ async def plan_scenes_from_chapter(
     chapter_text: str,
     project_data: ProjectData,
     *,
+    chapter_meta: Mapping[str, Any] | None = None,
     client: LLMClient | None = None,
 ) -> ProjectData:
     data = _ensure_scene_data(project_data)
     llm = client or LLMClient()
+    source = _normalize_chapter_meta(chapter_meta, chapter_text)
     planned = await llm.json(
         _scene_messages(chapter_text, data),
         mock_response={"scenes": _mock_scenes(chapter_text, data)},
@@ -22,7 +24,7 @@ async def plan_scenes_from_chapter(
         planned = {}
 
     for scene in planned.get("scenes", []):
-        normalized = _normalize_scene(scene, data)
+        normalized = _normalize_scene(scene, data, source, chapter_text)
         if normalized:
             data["scenes"].append(normalized)
 
@@ -37,6 +39,7 @@ def _scene_messages(chapter_text: str, project_data: ProjectData) -> list[dict[s
                 "你是剧本策划。请把章节拆成场景大纲，只输出 JSON："
                 "{\"scenes\":[{\"title\":\"\",\"location_id\":\"\",\"characters\":[],\"summary\":\"\"}]}。"
                 "location_id 必须来自项目地点；characters 必须来自项目人物 ID。"
+                "Do not output source_ref, chapter_id or chapter_index; the backend will attach chapter source data."
             ),
         },
         {
@@ -56,7 +59,12 @@ def _ensure_scene_data(project_data: ProjectData) -> ProjectData:
     return data
 
 
-def _normalize_scene(scene: Any, data: ProjectData) -> dict[str, Any] | None:
+def _normalize_scene(
+    scene: Any,
+    data: ProjectData,
+    chapter_meta: dict[str, Any],
+    chapter_text: str,
+) -> dict[str, Any] | None:
     if not isinstance(scene, dict):
         return None
 
@@ -75,6 +83,7 @@ def _normalize_scene(scene: Any, data: ProjectData) -> dict[str, Any] | None:
         "location_id": location_id,
         "characters": characters,
         "summary": summary,
+        "source_ref": _build_source_ref(chapter_meta, scene, chapter_text, summary),
     }
 
 
@@ -123,16 +132,87 @@ def _mock_scenes(chapter_text: str, data: ProjectData) -> list[dict[str, Any]]:
         paragraphs = [chapter_text.strip()]
 
     scenes: list[dict[str, Any]] = []
-    for paragraph in paragraphs[:8]:
+    for paragraph_index, paragraph in enumerate(paragraphs[:8], start=1):
         scenes.append(
             {
                 "title": _make_scene_title(paragraph, len(scenes) + 1),
                 "location_id": _find_location_id(paragraph, data),
                 "characters": _find_character_ids(paragraph, data),
                 "summary": paragraph.replace("\n", " ")[:160],
+                "_source_excerpt": paragraph.replace("\n", " ")[:240],
+                "_paragraph_range": [paragraph_index, paragraph_index],
             }
         )
     return scenes
+
+
+def _normalize_chapter_meta(chapter_meta: Mapping[str, Any] | None, chapter_text: str) -> dict[str, Any]:
+    source = dict(chapter_meta or {})
+    chapter_index = _positive_int(source.get("chapter_index") or source.get("index"), 1)
+    chapter_id = str(source.get("chapter_id") or source.get("id") or f"chapter_{chapter_index}").strip()
+    chapter_title = str(source.get("chapter_title") or source.get("title") or source.get("heading") or chapter_id).strip()
+    content = str(source.get("content") or chapter_text or "").strip()
+    return {
+        "chapter_id": chapter_id or f"chapter_{chapter_index}",
+        "chapter_index": chapter_index,
+        "chapter_title": chapter_title or f"Chapter {chapter_index}",
+        "content": content,
+    }
+
+
+def _build_source_ref(
+    chapter_meta: dict[str, Any],
+    scene: dict[str, Any],
+    chapter_text: str,
+    summary: str,
+) -> dict[str, Any]:
+    excerpt = str(scene.get("_source_excerpt") or "").strip()
+    if not excerpt:
+        excerpt = _best_excerpt(str(chapter_meta.get("content") or chapter_text), summary)
+
+    source_ref: dict[str, Any] = {
+        "chapter_id": chapter_meta["chapter_id"],
+        "chapter_index": chapter_meta["chapter_index"],
+        "chapter_title": chapter_meta["chapter_title"],
+        "excerpt": excerpt,
+    }
+
+    paragraph_range = scene.get("_paragraph_range")
+    if _valid_paragraph_range(paragraph_range):
+        source_ref["paragraph_range"] = paragraph_range
+    return source_ref
+
+
+def _best_excerpt(chapter_text: str, summary: str) -> str:
+    paragraphs = [part.strip().replace("\n", " ") for part in chapter_text.split("\n\n") if part.strip()]
+    if not paragraphs:
+        return chapter_text.strip().replace("\n", " ")[:240]
+
+    summary_tokens = _tokens(summary)
+    if not summary_tokens:
+        return paragraphs[0][:240]
+
+    best = max(paragraphs, key=lambda paragraph: len(summary_tokens & _tokens(paragraph)))
+    return best[:240]
+
+
+def _tokens(text: str) -> set[str]:
+    return {token.lower() for token in str(text).replace("。", " ").replace(".", " ").split() if token.strip()}
+
+
+def _positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _valid_paragraph_range(value: Any) -> bool:
+    if not isinstance(value, list) or len(value) != 2:
+        return False
+    start, end = value
+    return isinstance(start, int) and isinstance(end, int) and start >= 1 and end >= start
 
 
 def _make_scene_title(text: str, index: int) -> str:

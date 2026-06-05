@@ -7,29 +7,38 @@ from typing import Any
 from pydantic import BaseModel
 
 from backend.schemas.script_yaml import ScriptYAML
+from backend.services.script_yaml_validator import repair_scene_source_refs
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "examples" / "sample_output.yaml"
 
 
-def export_script_yaml(script_yaml: ScriptYAML | Mapping[str, Any], output_path: str | Path = DEFAULT_OUTPUT_PATH) -> Path:
-    data = _validated_data(script_yaml)
+def export_script_yaml(
+    script_yaml: ScriptYAML | Mapping[str, Any],
+    output_path: str | Path = DEFAULT_OUTPUT_PATH,
+    *,
+    chapters: Any = None,
+) -> Path:
+    data = _validated_data(script_yaml, chapters=chapters)
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(to_yaml(data) + "\n", encoding="utf-8")
     return destination
 
 
-def to_yaml(value: ScriptYAML | Mapping[str, Any]) -> str:
-    data = _validated_data(value)
+def to_yaml(value: ScriptYAML | Mapping[str, Any], *, chapters: Any = None) -> str:
+    data = _validated_data(value, chapters=chapters)
     return "\n".join(_dump_value(data, indent=0))
 
 
-def _validated_data(value: ScriptYAML | Mapping[str, Any]) -> dict[str, Any]:
+def _validated_data(value: ScriptYAML | Mapping[str, Any], *, chapters: Any = None) -> dict[str, Any]:
     if isinstance(value, ScriptYAML):
         model = value
     else:
         model = ScriptYAML.model_validate(value)
+    if chapters:
+        repaired_data, _issues = repair_scene_source_refs(model, chapters)
+        model = ScriptYAML.model_validate(repaired_data)
     return model.model_dump(mode="json", exclude_none=True)
 
 

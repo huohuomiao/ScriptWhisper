@@ -60,3 +60,13 @@ def test_parse_chapters_returns_empty_list_without_headings() -> None:
     text = "雨停后的长街泛着冷光。\n她没有开口，只把电影票递给他。"
 
     assert parse_chapters(text) == []
+
+
+def test_parse_chapters_keeps_stable_indexes_and_word_counts_can_be_derived() -> None:
+    text = "Chapter 1 Opening\nAlice waits.\n\nChapter 2 Return\nBob arrives."
+
+    chapters = parse_chapters(text)
+
+    assert [chapter.index for chapter in chapters] == [1, 2]
+    assert [f"chapter_{chapter.index}" for chapter in chapters] == ["chapter_1", "chapter_2"]
+    assert [len(chapter.content) for chapter in chapters] == [12, 12]

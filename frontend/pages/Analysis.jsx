@@ -1,16 +1,32 @@
 import { BookMarked, FileText, MapPin, UsersRound } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 
+import ReadingToolbar from "../components/ReadingToolbar.jsx";
+import { readingClassName, useReadingSettings } from "../src/readingSettings.js";
 import { chapters as sampleChapters, scriptYaml as sampleScriptYaml } from "../src/sampleData.js";
 
 export default function Analysis({ chapters = sampleChapters, issues = [], mockMode = true, repaired = false, scriptYaml = sampleScriptYaml }) {
-  const totalWords = chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0);
+  const normalizedChapters = useMemo(() => chapters.map(normalizeChapter), [chapters]);
+  const totalWords = normalizedChapters.reduce((sum, chapter) => sum + chapter.wordCount, 0);
   const bible = buildStoryBible(scriptYaml);
+  const { settings, setFontSize, setHighlightColor, setLineHeight } = useReadingSettings();
+  const [selectedChapterId, setSelectedChapterId] = useState(normalizedChapters[0]?.id || "");
+  const selectedChapter = normalizedChapters.find((chapter) => chapter.id === selectedChapterId) || normalizedChapters[0];
+  const selectedSceneCount = selectedChapter
+    ? scriptYaml.scenes.filter((scene) => getSceneChapterId(scene) === selectedChapter.id).length
+    : 0;
+
+  useEffect(() => {
+    if (!normalizedChapters.some((chapter) => chapter.id === selectedChapterId)) {
+      setSelectedChapterId(normalizedChapters[0]?.id || "");
+    }
+  }, [normalizedChapters, selectedChapterId]);
 
   return (
     <section className="workspace">
       <div className="metric-grid metric-grid-five" aria-label="分析摘要">
         <Metric label="原文字数" value={totalWords.toLocaleString("zh-CN")} />
-        <Metric label="识别章节" value={chapters.length} />
+        <Metric label="识别章节" value={normalizedChapters.length} />
         <Metric label="人物数量" value={scriptYaml.characters.length} />
         <Metric label="地点数量" value={scriptYaml.locations.length} />
         <Metric label="生成场景" value={scriptYaml.scenes.length} />
@@ -19,6 +35,13 @@ export default function Analysis({ chapters = sampleChapters, issues = [], mockM
         {mockMode ? "mock 模式" : "AI API 模式"} · {repaired ? "已自动修复" : "Schema 已校验"}
         {issues.length ? ` · ${issues.length} 个修复记录` : ""}
       </p>
+      <ReadingToolbar
+        settings={settings}
+        onClearHighlight={() => setHighlightColor("yellow")}
+        onFontSizeChange={setFontSize}
+        onHighlightColorChange={setHighlightColor}
+        onLineHeightChange={setLineHeight}
+      />
 
       <section className="section-block">
         <SectionHeading icon={<BookMarked size={18} />} title="故事 Bible" />
@@ -33,8 +56,13 @@ export default function Analysis({ chapters = sampleChapters, issues = [], mockM
       <section className="section-block">
         <SectionHeading icon={<FileText size={18} />} title="章节列表" />
         <div className="chapter-list">
-          {chapters.map((chapter, index) => (
-            <article className="chapter-row" key={chapter.id}>
+          {normalizedChapters.map((chapter, index) => (
+            <button
+              className={`chapter-row ${chapter.id === selectedChapter?.id ? "selected" : ""}`}
+              key={chapter.id}
+              type="button"
+              onClick={() => setSelectedChapterId(chapter.id)}
+            >
               <span className="row-index">{index + 1}</span>
               <div>
                 <h2>{chapter.title}</h2>
@@ -44,9 +72,27 @@ export default function Analysis({ chapters = sampleChapters, issues = [], mockM
                 <span>{chapter.wordCount.toLocaleString("zh-CN")} 字</span>
                 <span>{chapter.status}</span>
               </div>
-            </article>
+            </button>
           ))}
         </div>
+        {selectedChapter && (
+          <article className="chapter-source-card">
+            <div className="section-heading">
+              <span className="heading-icon">
+                <FileText size={18} />
+              </span>
+              <h2>章节原文</h2>
+            </div>
+            <div className="chapter-source-meta">
+              <strong>{selectedChapter.title}</strong>
+              <span>{selectedChapter.wordCount.toLocaleString("zh-CN")} 字</span>
+              <span>{selectedSceneCount} 个场景</span>
+            </div>
+            <div className={`chapter-source-text ${readingClassName(settings)}`}>
+              {selectedChapter.content || selectedChapter.summary || "暂无章节原文。"}
+            </div>
+          </article>
+        )}
       </section>
 
       <div className="split-grid">
@@ -80,6 +126,23 @@ export default function Analysis({ chapters = sampleChapters, issues = [], mockM
       </div>
     </section>
   );
+}
+
+function normalizeChapter(chapter, index) {
+  const fallbackId = `chapter_${index + 1}`;
+  return {
+    ...chapter,
+    id: chapter.chapter_id || chapter.chapterId || chapter.id || fallbackId,
+    content: chapter.content || "",
+    summary: chapter.summary || "",
+    title: chapter.title || chapter.heading || `章节 ${index + 1}`,
+    wordCount: chapter.wordCount ?? chapter.word_count ?? (chapter.content || "").length,
+    status: chapter.status || "已分析",
+  };
+}
+
+function getSceneChapterId(scene) {
+  return scene.source_ref?.chapter_id || scene.sourceRef?.chapterId || scene.source_ref?.chapterId || "";
 }
 
 function buildStoryBible(scriptYaml) {

@@ -1,13 +1,34 @@
 import { MessageSquareText, Zap } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { polishScene } from "../src/api.js";
 
-export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange, onYamlChange }) {
-  const scene = scriptYaml.scenes.find((item) => item.id === selectedSceneId) || scriptYaml.scenes[0];
+export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange, onYamlChange, showSceneSelect = true }) {
+  const explicitScene = scriptYaml.scenes.find((item) => item.id === selectedSceneId);
+  const scene = explicitScene || (showSceneSelect ? scriptYaml.scenes[0] : null);
   const [isBusy, setIsBusy] = useState(false);
   const [pendingChange, setPendingChange] = useState(null);
-  const hasDialogue = scriptYaml.script.some((line) => line.scene_id === scene.id && line.type === "dialogue");
+  const hasDialogue = scene
+    ? scriptYaml.script.some((line) => line.scene_id === scene.id && line.type === "dialogue")
+    : false;
+
+  useEffect(() => {
+    setPendingChange(null);
+  }, [selectedSceneId]);
+
+  if (!scene) {
+    return (
+      <section className="scene-editor" aria-label="单场景润色">
+        <div className="section-heading">
+          <span className="heading-icon">
+            <Zap size={18} />
+          </span>
+          <h2>单场景润色</h2>
+        </div>
+        <p className="empty-state compact">当前章节还没有生成场景。</p>
+      </section>
+    );
+  }
 
   function applyConflictBoost() {
     updateScene("conflict", "强化冲突", (draft) => {
@@ -27,10 +48,7 @@ export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange
   }
 
   function applyDialogueRewrite() {
-    if (!hasDialogue) {
-      return;
-    }
-    updateScene("dialogue", "修改对白", (draft) => {
+    updateScene("dialogue", hasDialogue ? "修改对白" : "添加对白", (draft) => {
       const sceneCharacters = scene.characters;
       const fallbackCharacterId = sceneCharacters[0] || draft.characters[0]?.id;
       const dialogue = draft.script.find((line) => line.scene_id === scene.id && line.type === "dialogue");
@@ -94,22 +112,29 @@ export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange
       </div>
 
       <div className="editor-controls">
-        <label>
-          场景
-          <select
-            value={scene.id}
-            onChange={(event) => {
-              setPendingChange(null);
-              onSceneChange(event.target.value);
-            }}
-          >
-            {scriptYaml.scenes.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.title}
-              </option>
-            ))}
-          </select>
-        </label>
+        {showSceneSelect ? (
+          <label>
+            场景
+            <select
+              value={scene.id}
+              onChange={(event) => {
+                setPendingChange(null);
+                onSceneChange(event.target.value);
+              }}
+            >
+              {scriptYaml.scenes.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.title}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : (
+          <div className="current-scene-label">
+            <span>当前场景</span>
+            <strong>{scene.title}</strong>
+          </div>
+        )}
 
         <div className="editor-actions">
           <button disabled={isBusy} type="button" onClick={applyConflictBoost}>
@@ -117,13 +142,13 @@ export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange
             强化冲突
           </button>
           <button
-            disabled={isBusy || !hasDialogue}
-            title={hasDialogue ? "改写当前场景对白" : "当前场景没有对白"}
+            disabled={isBusy}
+            title={hasDialogue ? "改写当前场景对白" : "当前场景暂无对白，可以先添加对白。"}
             type="button"
             onClick={applyDialogueRewrite}
           >
             <MessageSquareText size={16} />
-            修改对白
+            {hasDialogue ? "修改对白" : "添加对白"}
           </button>
         </div>
       </div>
@@ -183,7 +208,10 @@ function sceneSnapshot(scriptYaml, sceneId) {
   const scene = scriptYaml.scenes.find((item) => item.id === sceneId);
   const lines = scriptYaml.script
     .filter((line) => line.scene_id === sceneId)
-    .map((line) => `${line.type}${line.character_id ? `/${line.character_id}` : ""}: ${line.content}`);
+    .map((line) => {
+      const speaker = line.speaker_name || line.speaker_id || line.character_id;
+      return `${line.type}${speaker ? `/${speaker}` : ""}: ${line.text || line.content}`;
+    });
 
   return {
     summary: scene?.summary || "未填写场景摘要。",

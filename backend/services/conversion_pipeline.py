@@ -22,6 +22,7 @@ async def convert_novel_text(
     chapters = parse_chapters(stripped_text)
     if not chapters:
         chapters = [_single_chapter(stripped_text, title)]
+    chapter_responses = [_chapter_response(chapter, index) for index, chapter in enumerate(chapters, start=1)]
 
     settings = LLMSettings.from_env()
     if mock is not None:
@@ -43,16 +44,21 @@ async def convert_novel_text(
         "scenes": [],
     }
 
-    for chapter in chapters:
+    for chapter, chapter_response in zip(chapters, chapter_responses, strict=True):
         chapter_text = chapter.content.strip() or chapter.heading
         project_data = await extract_entities_from_chapter(chapter_text, project_data, client=client)
-        project_data = await plan_scenes_from_chapter(chapter_text, project_data, client=client)
+        project_data = await plan_scenes_from_chapter(
+            chapter_text,
+            project_data,
+            chapter_meta=chapter_response.model_dump(mode="json"),
+            client=client,
+        )
 
     script_yaml_data = await generate_script_yaml_data(project_data, client=client)
-    result = validate_or_repair_script_yaml(script_yaml_data)
+    result = validate_or_repair_script_yaml(script_yaml_data, chapters=chapter_responses)
 
     return ConvertResponse(
-        chapters=[_chapter_response(chapter, index) for index, chapter in enumerate(chapters, start=1)],
+        chapters=chapter_responses,
         script_yaml=result.data,
         repaired=result.repaired,
         issues=result.issues,
@@ -87,6 +93,8 @@ def _chapter_response(chapter: Chapter, index: int) -> ChapterResponse:
     summary = content.replace("\n", " ")[:120] if content else chapter.heading
     return ChapterResponse(
         id=f"chapter_{index}",
+        chapter_id=f"chapter_{index}",
+        chapter_index=index,
         title=title,
         heading=payload["heading"],
         marker=payload["marker"],

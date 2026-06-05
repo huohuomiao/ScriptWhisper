@@ -86,9 +86,13 @@ export default function App() {
         />
       )}
       {activePage === "preview" && (
-        <ScriptPreview onScriptYamlChange={handleScriptYamlChange} scriptYaml={project.scriptYaml} />
+        <ScriptPreview
+          chapters={project.chapters}
+          onScriptYamlChange={handleScriptYamlChange}
+          scriptYaml={project.scriptYaml}
+        />
       )}
-      {activePage === "export" && <Export scriptYaml={project.scriptYaml} />}
+      {activePage === "export" && <Export chapters={project.chapters} scriptYaml={project.scriptYaml} />}
     </main>
   );
 }
@@ -125,8 +129,11 @@ function loadInitialProject() {
 
 function normalizeChapters(chapters) {
   return chapters.map((chapter, index) => ({
-    id: chapter.id || `chapter_${index + 1}`,
+    id: chapter.chapter_id || chapter.id || `chapter_${index + 1}`,
+    chapterId: chapter.chapter_id || chapter.id || `chapter_${index + 1}`,
+    chapterIndex: chapter.chapter_index || chapter.chapterIndex || index + 1,
     title: chapter.title || chapter.heading || `章节 ${index + 1}`,
+    content: chapter.content || "",
     summary: chapter.summary || "",
     wordCount: chapter.wordCount ?? chapter.word_count ?? (chapter.content || "").length,
     status: chapter.status || "已分析",
