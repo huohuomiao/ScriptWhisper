@@ -10,19 +10,23 @@ def test_convert_endpoint_runs_mock_pipeline() -> None:
     response = client.post(
         "/api/convert",
         json={
-            "title": "雨夜来信",
-            "text": "第一章 雨夜来信\n\n林澈在旧影院门口见到沈微。沈微把电影票递给他。",
+            "title": "Rain Letter",
+            "text": "Chapter 1 Rain Letter\n\nLin meets Shen outside the old cinema.",
             "source": "sample.txt",
             "mock": True,
         },
     )
 
     assert response.status_code == 200
-    data = response.json()
+    payload = response.json()
+    data = payload["data"]
 
+    assert payload["success"] is True
+    assert payload["message"] == "Novel converted."
+    assert payload["error_code"] is None
     assert data["mock_mode"] is True
-    assert data["chapters"][0]["title"] == "第一章 雨夜来信"
-    assert data["script_yaml"]["project"]["title"] == "雨夜来信"
+    assert data["chapters"]
+    assert data["script_yaml"]["project"]["title"] == "Rain Letter"
     assert data["script_yaml"]["characters"]
     assert data["script_yaml"]["locations"]
     assert data["script_yaml"]["scenes"]
@@ -34,12 +38,12 @@ def test_polish_scene_endpoint_updates_scriptyaml() -> None:
     convert_response = client.post(
         "/api/convert",
         json={
-            "title": "雨夜来信",
-            "text": "林澈在旧影院门口见到沈微。",
+            "title": "Rain Letter",
+            "text": "Lin meets Shen outside the old cinema.",
             "mock": True,
         },
     )
-    script_yaml = convert_response.json()["script_yaml"]
+    script_yaml = convert_response.json()["data"]["script_yaml"]
     scene_id = script_yaml["scenes"][0]["id"]
 
     response = client.post(
@@ -52,11 +56,28 @@ def test_polish_scene_endpoint_updates_scriptyaml() -> None:
     )
 
     assert response.status_code == 200
-    data = response.json()
+    payload = response.json()
+    data = payload["data"]
     scene = data["script_yaml"]["scenes"][0]
 
-    assert "压力升级" in scene["summary"]
+    assert payload["success"] is True
+    assert payload["message"] == "Scene polished."
+    assert payload["error_code"] is None
+    assert scene["summary"]
     assert any(line["scene_id"] == scene_id and line["type"] == "note" for line in data["script_yaml"]["script"])
+
+
+def test_convert_endpoint_validation_error_uses_api_envelope() -> None:
+    client = TestClient(app)
+
+    response = client.post("/api/convert", json={"text": ""})
+
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["message"] == "Request validation failed."
+    assert payload["error_code"] == "VALIDATION_ERROR"
+    assert payload["data"]["errors"]
 
 
 def test_project_optional_empty_strings_become_none() -> None:

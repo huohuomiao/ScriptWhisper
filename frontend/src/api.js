@@ -36,6 +36,12 @@ export async function polishScene({ scriptYaml, sceneId, action }) {
 async function requestJson(path, options) {
   const response = await fetch(`${API_BASE_URL}${path}`, options);
   const payload = await response.json().catch(() => ({}));
+  if (typeof payload.success === "boolean") {
+    if (!payload.success) {
+      throw new Error(payload.message || payload.error_code || `Request failed: ${response.status}`);
+    }
+    return payload.data;
+  }
   if (!response.ok) {
     throw new Error(payload.detail || `Request failed: ${response.status}`);
   }

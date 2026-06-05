@@ -17,16 +17,19 @@ def test_upload_sample_novel_3chapters(tmp_path, monkeypatch) -> None:
             files={"file": ("sample_novel_3chapters.txt", sample_file, "text/plain")},
         )
 
-    data = response.json()
+    assert response.status_code == 200
+    payload = response.json()
+    data = payload["data"]
     saved_file = tmp_path / data["stored_filename"]
 
-    assert response.status_code == 200
+    assert payload["success"] is True
+    assert payload["message"] == "Upload completed."
+    assert payload["error_code"] is None
     assert data["filename"] == "sample_novel_3chapters.txt"
     assert data["size_bytes"] == sample_path.stat().st_size
-    assert "第一章" in data["content"]
-    assert "第三章" in data["content"]
+    assert data["content"] == sample_path.read_text(encoding="utf-8-sig")
     assert saved_file.exists()
-    assert saved_file.read_text(encoding="utf-8").startswith("第一章")
+    assert saved_file.read_bytes() == sample_path.read_bytes()
 
 
 def test_upload_rejects_non_txt_file() -> None:
@@ -38,7 +41,11 @@ def test_upload_rejects_non_txt_file() -> None:
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"] == "Only .txt files are supported."
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["message"] == "Only .txt files are supported."
+    assert payload["data"] is None
+    assert payload["error_code"] == "HTTP_400"
 
 
 def test_upload_rejects_whitespace_only_file() -> None:
@@ -50,4 +57,8 @@ def test_upload_rejects_whitespace_only_file() -> None:
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"] == "Uploaded file is empty."
+    payload = response.json()
+    assert payload["success"] is False
+    assert payload["message"] == "Uploaded file is empty."
+    assert payload["data"] is None
+    assert payload["error_code"] == "HTTP_400"

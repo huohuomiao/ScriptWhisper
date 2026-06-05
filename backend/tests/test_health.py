@@ -9,4 +9,8 @@ def test_health() -> None:
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["message"] == "ok"
+    assert payload["data"] == {"status": "ok"}
+    assert payload["error_code"] is None
