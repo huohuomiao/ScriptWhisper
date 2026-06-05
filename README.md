@@ -220,6 +220,10 @@ script:
 
 Demo 视频链接和最终检查记录见 `docs/final_check.md`。
 
+## 使用手册
+
+完整使用说明见 `docs/user_manual.md`，包括启动方式、AI API 配置、前端操作、后端接口和常见问题。
+
 ## PR 记录
 
 | PR | 主题 |
