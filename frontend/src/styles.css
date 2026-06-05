@@ -318,6 +318,67 @@ td {
   font-weight: 700;
 }
 
+.export-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 18px;
+}
+
+.export-panel {
+  min-height: 520px;
+  border: 1px solid #ded4c5;
+  border-radius: 8px;
+  padding: 18px;
+  background: #fffdf8;
+  box-shadow: 0 14px 42px rgb(54 44 30 / 7%);
+}
+
+.export-heading {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 14px;
+}
+
+.export-heading h2 {
+  margin-bottom: 3px;
+  font-size: 1.05rem;
+}
+
+.export-heading p {
+  margin-bottom: 0;
+  color: #69777d;
+  font-size: 0.88rem;
+}
+
+.export-heading button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 40px;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 14px;
+  color: #ffffff;
+  background: #1d6f7a;
+}
+
+.export-preview {
+  height: 420px;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid #e3d9ca;
+  border-radius: 6px;
+  padding: 14px;
+  color: #26363d;
+  background: #ffffff;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 0.86rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
 .scene-header {
   display: grid;
   grid-template-columns: 46px minmax(0, 1fr);
@@ -434,7 +495,8 @@ td {
   }
 
   .metric-grid,
-  .split-grid {
+  .split-grid,
+  .export-grid {
     grid-template-columns: 1fr;
   }
 
@@ -463,6 +525,15 @@ td {
   }
 
   .editor-actions button {
+    justify-content: center;
+  }
+
+  .export-heading {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .export-heading button {
+    grid-column: 1 / -1;
     justify-content: center;
   }
 }
