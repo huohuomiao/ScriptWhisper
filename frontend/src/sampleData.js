@@ -29,6 +29,12 @@ export const scriptYaml = {
     genre: "悬疑短剧",
     logline: "旧影院重逢的一夜，让两个人重新面对十年前错过的答案。",
     source: "sample_novel_3chapters.txt",
+    bible: {
+      story_type: "情感悬疑短剧",
+      main_conflict: "林澈想继续逃避十年前的选择，沈微逼他重新进入旧影院面对真相。",
+      central_mystery: "那封没有署名的信到底写给过去的林澈，还是写给此刻仍在逃避的他。",
+      adaptation_advice: "保留旧影院、电影票和白光门作为贯穿意象，把回忆信息分散到每个场景的动作和对白中。",
+    },
   },
   characters: [
     {
@@ -36,12 +42,20 @@ export const scriptYaml = {
       name: "林澈",
       role: "男主角",
       description: "带着旧信来到影院门口的人，长期回避十年前的选择。",
+      personality: "克制、敏感、习惯回避冲突",
+      motivation: "弄清旧信来源，并确认自己是否还有弥补的机会",
+      speech_style: "短句多，常用反问和停顿隐藏真实情绪",
+      first_chapter: "第一章 雨夜来信",
     },
     {
       id: "shen_wei",
       name: "沈微",
       role: "女主角",
       description: "等待多年并递出旧电影票的人，推动林澈面对答案。",
+      personality: "冷静、坚定、带有压抑的锋芒",
+      motivation: "让林澈停止逃避，重新走进两人共同的旧伤口",
+      speech_style: "语气平静但指向明确，常用条件句制造压力",
+      first_chapter: "第一章 雨夜来信",
     },
   ],
   locations: [
@@ -49,11 +63,15 @@ export const scriptYaml = {
       id: "old_cinema",
       name: "旧影院门口",
       description: "雨停后的长街尽头，灯箱仍然亮着。",
+      atmosphere: "潮湿、冷光、怀旧又压抑",
+      plot_use: "重逢入口，触发电影票和旧信的核心线索",
     },
     {
       id: "projection_room",
       name: "放映室",
       description: "尘埃漂浮在光束里，旧放映机重新启动。",
+      atmosphere: "封闭、昏暗、机械声带来不安节奏",
+      plot_use: "让记忆影像实体化，推动林澈面对十年前的选择",
     },
   ],
   scenes: [
