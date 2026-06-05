@@ -10,9 +10,56 @@ export default function ConversionDemo() {
   const [script, setScript] = useState("");
   const [provider, setProvider] = useState("");
   const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadedFile, setUploadedFile] = useState("");
   const [error, setError] = useState("");
 
-  const canSubmit = useMemo(() => novelText.trim().length > 0 && !loading, [novelText, loading]);
+  const canSubmit = useMemo(
+    () => novelText.trim().length > 0 && !loading && !uploading,
+    [novelText, loading, uploading],
+  );
+
+  async function handleFileUpload(event) {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    setUploading(true);
+    setError("");
+    setUploadedFile("");
+
+    try {
+      if (!file.name.toLowerCase().endsWith(".txt")) {
+        throw new Error("请上传 .txt 文件");
+      }
+
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const response = await fetch(`${apiBaseUrl}/api/upload`, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({}));
+        throw new Error(detail.detail || "上传失败");
+      }
+
+      const data = await response.json();
+      const sizeKb = Math.max(1, Math.ceil(data.size_bytes / 1024));
+      setNovelText(data.content);
+      setUploadedFile(`${data.filename} · ${sizeKb} KB`);
+      setScript("");
+      setProvider("");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      event.target.value = "";
+      setUploading(false);
+    }
+  }
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -59,6 +106,14 @@ export default function ConversionDemo() {
             <option>分镜脚本</option>
             <option>舞台剧本</option>
           </select>
+        </div>
+
+        <div className="upload-row">
+          <label className="file-upload">
+            <input type="file" accept=".txt,text/plain" onChange={handleFileUpload} disabled={uploading} />
+            <span>{uploading ? "上传中..." : "上传 TXT"}</span>
+          </label>
+          {uploadedFile && <span className="upload-status">已载入 {uploadedFile}</span>}
         </div>
 
         <textarea

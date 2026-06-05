@@ -139,6 +139,55 @@ h2 {
   margin-bottom: 14px;
 }
 
+.upload-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 38px;
+  margin-bottom: 12px;
+}
+
+.file-upload {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  border: 1px solid #cbbfac;
+  border-radius: 6px;
+  padding: 0 14px;
+  color: #233238;
+  background: #f2eadf;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.file-upload:hover {
+  background: #e8ded0;
+}
+
+.file-upload input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.file-upload:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.upload-status {
+  overflow: hidden;
+  color: #5f6b70;
+  font-size: 0.88rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 select {
   min-height: 36px;
   border: 1px solid #cbbfac;
@@ -231,6 +280,11 @@ pre {
   }
 
   .actions {
+    flex-direction: column;
+  }
+
+  .upload-row {
+    align-items: flex-start;
     flex-direction: column;
   }
 }

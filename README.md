@@ -13,11 +13,16 @@
 │   │   ├── api.py
 │   │   └── config.py
 │   ├── services/
-│   │   └── ai_client.py
+│   │   ├── ai_client.py
+│   │   └── upload_storage.py
 │   ├── schemas/
-│   │   └── conversion.py
+│   │   ├── conversion.py
+│   │   └── upload.py
 │   ├── tests/
-│   │   └── test_health.py
+│   │   ├── test_health.py
+│   │   └── test_upload.py
+│   ├── uploads/
+│   │   └── .gitkeep
 │   └── main.py
 ├── frontend/
 │   ├── src/
@@ -34,7 +39,8 @@
 ├── docs/
 │   └── API.md
 ├── examples/
-│   └── sample_novel.txt
+│   ├── sample_novel.txt
+│   └── sample_novel_3chapters.txt
 ├── requirements.txt
 ├── package.json
 └── README.md
@@ -87,3 +93,7 @@ AI_MODEL=your-model-name
 ```
 
 如果没有配置 API key 或 API 地址，`/api/convert` 会返回本地示例结果，便于前后端直接联调。
+
+## 上传小说文本
+
+前端支持上传 UTF-8 编码的 `.txt` 文件。后端接口为 `POST /api/upload`，会把文件保存到 `backend/uploads/`，并返回文本内容供前端填入编辑器。
