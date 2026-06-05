@@ -9,7 +9,7 @@ from backend.services.entity_extractor import ProjectData
 VALID_LINE_TYPES: set[str] = {"action", "dialogue", "transition", "note"}
 
 
-async def generate_script_yaml(project_data: ProjectData, *, client: LLMClient | None = None) -> ScriptYAML:
+async def generate_script_yaml_data(project_data: ProjectData, *, client: LLMClient | None = None) -> ProjectData:
     data = _ensure_script_yaml_base(project_data)
     llm = client or LLMClient()
     generated = await llm.json(
@@ -20,6 +20,11 @@ async def generate_script_yaml(project_data: ProjectData, *, client: LLMClient |
         generated = {}
 
     data["script"] = _normalize_script_lines(generated.get("script", []), data)
+    return data
+
+
+async def generate_script_yaml(project_data: ProjectData, *, client: LLMClient | None = None) -> ScriptYAML:
+    data = await generate_script_yaml_data(project_data, client=client)
     return ScriptYAML.model_validate(data)
 
 

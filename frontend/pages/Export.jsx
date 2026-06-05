@@ -1,8 +1,8 @@
 import { Download, FileCode2, FileText } from "lucide-react";
 
-import { scriptYaml } from "../src/sampleData.js";
+import { scriptYaml as sampleScriptYaml } from "../src/sampleData.js";
 
-export default function Export() {
+export default function Export({ scriptYaml = sampleScriptYaml }) {
   const yamlText = toYaml(scriptYaml);
   const markdownText = toMarkdown(scriptYaml);
 

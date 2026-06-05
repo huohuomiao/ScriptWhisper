@@ -18,6 +18,7 @@ body {
 }
 
 button,
+input,
 textarea {
   font: inherit;
 }
@@ -37,6 +38,8 @@ select {
 }
 
 button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
 select:focus-visible {
   outline: 3px solid rgb(29 111 122 / 22%);
   outline-offset: 2px;
@@ -146,6 +149,76 @@ h1 {
   padding: 0;
   color: #2d3b42;
   font-weight: 700;
+}
+
+.upload-workbench {
+  display: grid;
+  gap: 14px;
+}
+
+.field-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+}
+
+.upload-workbench label {
+  display: grid;
+  gap: 6px;
+  color: #6b5b44;
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
+.upload-workbench input,
+.upload-workbench textarea {
+  width: 100%;
+  border: 1px solid #cdbfa9;
+  border-radius: 6px;
+  padding: 10px 12px;
+  color: #27363c;
+  background: #ffffff;
+}
+
+.upload-workbench textarea {
+  min-height: 180px;
+  resize: vertical;
+  line-height: 1.65;
+}
+
+.submit-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.submit-row button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 16px;
+  color: #ffffff;
+  background: #1d6f7a;
+}
+
+.submit-row button:disabled,
+.editor-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.submit-row span,
+.analysis-status {
+  color: #1d6f7a;
+  font-weight: 700;
+}
+
+.analysis-status {
+  margin: -6px 0 0;
 }
 
 .metric-grid {
@@ -540,6 +613,7 @@ td {
   .metric-grid,
   .split-grid,
   .export-grid,
+  .field-row,
   .intro-block,
   .intro-points {
     grid-template-columns: 1fr;

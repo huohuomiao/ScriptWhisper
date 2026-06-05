@@ -1,6 +1,6 @@
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 ScriptLineType = Literal["action", "dialogue", "transition", "note"]
 
@@ -13,6 +13,16 @@ class ProjectInfo(BaseModel):
     genre: str | None = None
     logline: str | None = None
     source: str | None = None
+
+    @field_validator("genre", "logline", "source", mode="before")
+    @classmethod
+    def normalize_optional_text(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return str(value)
 
 
 class Character(BaseModel):

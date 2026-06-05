@@ -2,7 +2,7 @@ import { Camera, MessageSquareText, MoveRight, PencilLine } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import SceneEditor from "../components/SceneEditor.jsx";
-import { scriptYaml } from "../src/sampleData.js";
+import { scriptYaml as sampleScriptYaml } from "../src/sampleData.js";
 
 const lineMeta = {
   action: { label: "动作", icon: PencilLine },
@@ -11,7 +11,7 @@ const lineMeta = {
   transition: { label: "转场", icon: MoveRight },
 };
 
-export default function ScriptPreview() {
+export default function ScriptPreview({ scriptYaml = sampleScriptYaml, onScriptYamlChange }) {
   const [yamlData, setYamlData] = useState(scriptYaml);
   const [selectedSceneId, setSelectedSceneId] = useState(scriptYaml.scenes[0]?.id);
   const [status, setStatus] = useState("");
@@ -26,6 +26,7 @@ export default function ScriptPreview() {
 
   function handleYamlChange(nextYaml, message) {
     setYamlData(nextYaml);
+    onScriptYamlChange?.(nextYaml);
     setStatus(message);
   }
 

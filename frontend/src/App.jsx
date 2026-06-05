@@ -5,9 +5,33 @@ import Analysis from "../pages/Analysis.jsx";
 import Export from "../pages/Export.jsx";
 import Home from "../pages/Home.jsx";
 import ScriptPreview from "../pages/ScriptPreview.jsx";
+import { chapters as sampleChapters, scriptYaml as sampleScriptYaml } from "./sampleData.js";
+
+const STORAGE_KEY = "scriptwhisper.project";
 
 export default function App() {
   const [activePage, setActivePage] = useState("home");
+  const [project, setProject] = useState(loadInitialProject);
+
+  function updateProject(nextProject) {
+    setProject(nextProject);
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(nextProject));
+  }
+
+  function handleAnalysisComplete(result) {
+    updateProject({
+      chapters: normalizeChapters(result.chapters),
+      issues: result.issues || [],
+      mockMode: result.mock_mode,
+      repaired: result.repaired,
+      scriptYaml: result.script_yaml,
+    });
+    setActivePage("analysis");
+  }
+
+  function handleScriptYamlChange(nextYaml) {
+    updateProject({ ...project, scriptYaml: nextYaml });
+  }
 
   return (
     <main className="app-shell">
@@ -51,10 +75,20 @@ export default function App() {
           </button>
         </nav>
       </header>
-      {activePage === "home" && <Home />}
-      {activePage === "analysis" && <Analysis />}
-      {activePage === "preview" && <ScriptPreview />}
-      {activePage === "export" && <Export />}
+      {activePage === "home" && <Home onAnalysisComplete={handleAnalysisComplete} />}
+      {activePage === "analysis" && (
+        <Analysis
+          chapters={project.chapters}
+          issues={project.issues}
+          mockMode={project.mockMode}
+          repaired={project.repaired}
+          scriptYaml={project.scriptYaml}
+        />
+      )}
+      {activePage === "preview" && (
+        <ScriptPreview onScriptYamlChange={handleScriptYamlChange} scriptYaml={project.scriptYaml} />
+      )}
+      {activePage === "export" && <Export scriptYaml={project.scriptYaml} />}
     </main>
   );
 }
@@ -70,4 +104,31 @@ function pageTitle(activePage) {
     return "导出";
   }
   return "小说分析";
+}
+
+function loadInitialProject() {
+  const fallback = {
+    chapters: sampleChapters,
+    issues: [],
+    mockMode: true,
+    repaired: false,
+    scriptYaml: sampleScriptYaml,
+  };
+
+  try {
+    const stored = window.localStorage.getItem(STORAGE_KEY);
+    return stored ? { ...fallback, ...JSON.parse(stored) } : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeChapters(chapters) {
+  return chapters.map((chapter, index) => ({
+    id: chapter.id || `chapter_${index + 1}`,
+    title: chapter.title || chapter.heading || `章节 ${index + 1}`,
+    summary: chapter.summary || "",
+    wordCount: chapter.wordCount ?? chapter.word_count ?? (chapter.content || "").length,
+    status: chapter.status || "已分析",
+  }));
 }

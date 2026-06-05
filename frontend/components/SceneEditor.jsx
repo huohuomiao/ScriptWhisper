@@ -1,10 +1,14 @@
 import { MessageSquareText, Zap } from "lucide-react";
+import { useState } from "react";
+
+import { polishScene } from "../src/api.js";
 
 export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange, onYamlChange }) {
   const scene = scriptYaml.scenes.find((item) => item.id === selectedSceneId) || scriptYaml.scenes[0];
+  const [isBusy, setIsBusy] = useState(false);
 
   function applyConflictBoost() {
-    updateScene("强化冲突", (draft) => {
+    updateScene("conflict", "强化冲突", (draft) => {
       const targetScene = draft.scenes.find((item) => item.id === scene.id);
       targetScene.summary = `${targetScene.summary || targetScene.title} 双方目标更明确，场面压力升级。`;
       draft.script.push({
@@ -21,7 +25,7 @@ export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange
   }
 
   function applyDialogueRewrite() {
-    updateScene("修改对白", (draft) => {
+    updateScene("dialogue", "修改对白", (draft) => {
       const sceneCharacters = scene.characters;
       const fallbackCharacterId = sceneCharacters[0] || draft.characters[0]?.id;
       const dialogue = draft.script.find((line) => line.scene_id === scene.id && line.type === "dialogue");
@@ -40,10 +44,18 @@ export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange
     });
   }
 
-  function updateScene(actionLabel, recipe) {
-    const draft = structuredClone(scriptYaml);
-    recipe(draft);
-    onYamlChange(draft, `${scene.title} 已执行：${actionLabel}`);
+  async function updateScene(action, actionLabel, recipe) {
+    setIsBusy(true);
+    try {
+      const result = await polishScene({ scriptYaml, sceneId: scene.id, action });
+      onYamlChange(result.script_yaml, `${scene.title} 已执行：${actionLabel}`);
+    } catch {
+      const draft = structuredClone(scriptYaml);
+      recipe(draft);
+      onYamlChange(draft, `${scene.title} 已执行：${actionLabel}（本地）`);
+    } finally {
+      setIsBusy(false);
+    }
   }
 
   return (
@@ -68,11 +80,11 @@ export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange
         </label>
 
         <div className="editor-actions">
-          <button type="button" onClick={applyConflictBoost}>
+          <button disabled={isBusy} type="button" onClick={applyConflictBoost}>
             <Zap size={16} />
             强化冲突
           </button>
-          <button type="button" onClick={applyDialogueRewrite}>
+          <button disabled={isBusy} type="button" onClick={applyDialogueRewrite}>
             <MessageSquareText size={16} />
             修改对白
           </button>

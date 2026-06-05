@@ -20,7 +20,7 @@ Demo 视频链接：待上传。
 
 当前 `origin/main` 仍处于初始提交状态，只包含 `README.md`，尚未合并 PR-01 到 PR-21。因此严格意义上，`origin/main` 当前不能直接运行完整应用。
 
-可运行性验证已在当前堆叠分支 `pr-21-demo-final-check` 上完成。该分支已经补齐最终集成所需的 FastAPI 入口、健康检查、TXT 上传、章节解析器、pytest 路径配置和仓库级 `.gitignore`。
+可运行性验证已在当前堆叠分支 `pr-21-demo-final-check` 上完成。该分支已经补齐最终集成所需的 FastAPI 入口、健康检查、TXT 上传、AI 转换接口、场景润色接口、章节解析器、pytest 路径配置和仓库级 `.gitignore`。
 
 ```powershell
 pip install -r requirements.txt
@@ -32,8 +32,10 @@ Invoke-WebRequest http://127.0.0.1:5173
 
 验证结果：
 
-- 后端测试：13 passed
+- 后端测试：16 passed
 - 后端 HTTP：`GET /health` 返回 `{"status":"ok"}`
+- 后端 HTTP：`POST /api/convert` 可返回 ScriptYAML
+- 后端 HTTP：`POST /api/scenes/polish` 可返回润色后的 ScriptYAML
 - 前端构建：通过
 - 前端开发服务：`200 OK`
 - examples：已补齐输入、三章节输入、YAML 输出和 Markdown 输出

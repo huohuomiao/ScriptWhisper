@@ -1,8 +1,8 @@
 import { FileText, MapPin, UsersRound } from "lucide-react";
 
-import { chapters, scriptYaml } from "../src/sampleData.js";
+import { chapters as sampleChapters, scriptYaml as sampleScriptYaml } from "../src/sampleData.js";
 
-export default function Analysis() {
+export default function Analysis({ chapters = sampleChapters, issues = [], mockMode = true, repaired = false, scriptYaml = sampleScriptYaml }) {
   const totalWords = chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0);
 
   return (
@@ -13,6 +13,10 @@ export default function Analysis() {
         <Metric label="地点" value={scriptYaml.locations.length} />
         <Metric label="字数" value={totalWords.toLocaleString("zh-CN")} />
       </div>
+      <p className="analysis-status">
+        {mockMode ? "mock 模式" : "AI API 模式"} · {repaired ? "已自动修复" : "Schema 已校验"}
+        {issues.length ? ` · ${issues.length} 个修复记录` : ""}
+      </p>
 
       <section className="section-block">
         <SectionHeading icon={<FileText size={18} />} title="章节列表" />
