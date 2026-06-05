@@ -81,6 +81,17 @@ export const scriptYaml = {
       location_id: "old_cinema",
       characters: ["lin_che", "shen_wei"],
       summary: "林澈在旧影院门口见到沈微，并收到十年前的电影票。",
+      source_ref: {
+        chapter_id: "chapter_1",
+        chapter_title: "第一章 雨夜来信",
+        evidence: "雨停后的长街泛着冷光。林澈握着那封没有署名的信，终于在旧影院门口看见了等候多时的沈微。",
+      },
+      beats: {
+        goal: "林澈想确认旧信与电影票的来源。",
+        conflict: "沈微逼他进入旧影院，林澈仍想回避十年前的错过。",
+        turn: "沈微拿出十年前的电影票，改变林澈对重逢的理解。",
+        outcome: "林澈被迫留下，故事进入旧影院内部。",
+      },
     },
     {
       id: "scene_2",
@@ -88,6 +99,17 @@ export const scriptYaml = {
       location_id: "projection_room",
       characters: ["lin_che", "shen_wei"],
       summary: "放映机启动，银幕播放两人记忆中的巷子。",
+      source_ref: {
+        chapter_id: "chapter_2",
+        chapter_title: "第二章 旧影院",
+        evidence: "影院大门被风推开，尘埃在光束里缓慢漂浮。放映室里传来机器启动的声音。",
+      },
+      beats: {
+        goal: "两人进入放映室，寻找银幕出现异常影像的原因。",
+        conflict: "银幕播放的不是电影，而是林澈反复逃避的记忆。",
+        turn: "沈微说出如果今晚不进去，两人会再错过一次。",
+        outcome: "林澈意识到旧信指向的是此刻的选择。",
+      },
     },
   ],
   script: [
