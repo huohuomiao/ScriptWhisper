@@ -1,0 +1,19 @@
+{
+  "name": "scriptwhisper-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite frontend --host 0.0.0.0",
+    "build": "vite build frontend",
+    "preview": "vite preview frontend --host 0.0.0.0"
+  },
+  "dependencies": {
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^6.0.2",
+    "vite": "^8.0.16"
+  }
+}
