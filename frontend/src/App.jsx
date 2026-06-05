@@ -1,12 +1,13 @@
-import { BookOpenText, Clapperboard, Download } from "lucide-react";
+import { BookOpenText, Clapperboard, Download, House } from "lucide-react";
 import { useState } from "react";
 
 import Analysis from "../pages/Analysis.jsx";
 import Export from "../pages/Export.jsx";
+import Home from "../pages/Home.jsx";
 import ScriptPreview from "../pages/ScriptPreview.jsx";
 
 export default function App() {
-  const [activePage, setActivePage] = useState("analysis");
+  const [activePage, setActivePage] = useState("home");
 
   return (
     <main className="app-shell">
@@ -16,6 +17,14 @@ export default function App() {
           <h1>{pageTitle(activePage)}</h1>
         </div>
         <nav className="nav-tabs" aria-label="工作台导航">
+          <button
+            className={`nav-tab ${activePage === "home" ? "active" : ""}`}
+            type="button"
+            onClick={() => setActivePage("home")}
+          >
+            <House size={16} />
+            首页
+          </button>
           <button
             className={`nav-tab ${activePage === "analysis" ? "active" : ""}`}
             type="button"
@@ -42,6 +51,7 @@ export default function App() {
           </button>
         </nav>
       </header>
+      {activePage === "home" && <Home />}
       {activePage === "analysis" && <Analysis />}
       {activePage === "preview" && <ScriptPreview />}
       {activePage === "export" && <Export />}
@@ -50,6 +60,9 @@ export default function App() {
 }
 
 function pageTitle(activePage) {
+  if (activePage === "home") {
+    return "ScriptWhisper";
+  }
   if (activePage === "preview") {
     return "剧本预览";
   }

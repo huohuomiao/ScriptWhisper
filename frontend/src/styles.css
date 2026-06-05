@@ -112,6 +112,42 @@ h1 {
   margin-top: 22px;
 }
 
+.intro-block {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(280px, 0.9fr);
+  gap: 22px;
+  align-items: center;
+}
+
+.intro-block h2 {
+  margin-bottom: 12px;
+  font-size: 1.75rem;
+  line-height: 1.25;
+}
+
+.intro-block p:last-child {
+  margin-bottom: 0;
+  color: #56666d;
+  font-size: 1rem;
+  line-height: 1.75;
+}
+
+.intro-points {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.intro-point {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 38px;
+  padding: 0;
+  color: #2d3b42;
+  font-weight: 700;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -139,8 +175,15 @@ h1 {
 }
 
 .metric strong {
+  display: block;
   font-size: 2rem;
   line-height: 1;
+  overflow-wrap: anywhere;
+}
+
+.metric strong.metric-compact {
+  font-size: 1.35rem;
+  line-height: 1.2;
 }
 
 .section-block {
@@ -496,7 +539,9 @@ td {
 
   .metric-grid,
   .split-grid,
-  .export-grid {
+  .export-grid,
+  .intro-block,
+  .intro-points {
     grid-template-columns: 1fr;
   }
 

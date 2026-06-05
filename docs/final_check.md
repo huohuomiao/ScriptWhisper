@@ -20,17 +20,20 @@ Demo 视频链接：待上传。
 
 当前 `origin/main` 仍处于初始提交状态，只包含 `README.md`，尚未合并 PR-01 到 PR-21。因此严格意义上，`origin/main` 当前不能直接运行完整应用。
 
-可运行性验证已在当前堆叠分支 `pr-21-demo-final-check` 上完成：
+可运行性验证已在当前堆叠分支 `pr-21-demo-final-check` 上完成。该分支已经补齐最终集成所需的 FastAPI 入口、健康检查、TXT 上传、章节解析器、pytest 路径配置和仓库级 `.gitignore`。
 
 ```powershell
+pip install -r requirements.txt
 pytest backend/tests
 npm run build
+uvicorn backend.main:app --host 127.0.0.1 --port 8000
 Invoke-WebRequest http://127.0.0.1:5173
 ```
 
 验证结果：
 
-- 后端测试：通过
+- 后端测试：13 passed
+- 后端 HTTP：`GET /health` 返回 `{"status":"ok"}`
 - 前端构建：通过
 - 前端开发服务：`200 OK`
 - examples：已补齐输入、三章节输入、YAML 输出和 Markdown 输出
@@ -57,4 +60,4 @@ examples/
 
 ## 合并建议
 
-PR-15 到 PR-21 是顺序堆叠关系，建议按编号合并。PR-01 到 PR-14 中有部分早期分支从 `origin/main` 独立切出，如需最终主分支完整可运行，应先整理合并顺序或做一次集成分支。
+PR-15 到 PR-21 是顺序堆叠关系，建议按编号合并。当前 `pr-21-demo-final-check` 分支已经做过最终集成补齐；如需让 `main` 直接可运行，应将 PR 链合并到 `main` 后再执行同样的检查命令。
