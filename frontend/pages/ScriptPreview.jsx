@@ -1,5 +1,7 @@
 import { Camera, MessageSquareText, MoveRight, PencilLine } from "lucide-react";
+import { useMemo, useState } from "react";
 
+import SceneEditor from "../components/SceneEditor.jsx";
 import { scriptYaml } from "../src/sampleData.js";
 
 const lineMeta = {
@@ -10,19 +12,41 @@ const lineMeta = {
 };
 
 export default function ScriptPreview() {
-  const characterById = new Map(scriptYaml.characters.map((character) => [character.id, character]));
-  const locationById = new Map(scriptYaml.locations.map((location) => [location.id, location]));
+  const [yamlData, setYamlData] = useState(scriptYaml);
+  const [selectedSceneId, setSelectedSceneId] = useState(scriptYaml.scenes[0]?.id);
+  const [status, setStatus] = useState("");
+  const characterById = useMemo(
+    () => new Map(yamlData.characters.map((character) => [character.id, character])),
+    [yamlData.characters],
+  );
+  const locationById = useMemo(
+    () => new Map(yamlData.locations.map((location) => [location.id, location])),
+    [yamlData.locations],
+  );
+
+  function handleYamlChange(nextYaml, message) {
+    setYamlData(nextYaml);
+    setStatus(message);
+  }
 
   return (
     <section className="workspace">
+      <SceneEditor
+        onSceneChange={setSelectedSceneId}
+        onYamlChange={handleYamlChange}
+        scriptYaml={yamlData}
+        selectedSceneId={selectedSceneId}
+      />
+      {status && <p className="editor-status">{status}</p>}
+
       <div className="preview-grid">
-        {scriptYaml.scenes.map((scene, index) => {
-          const lines = scriptYaml.script.filter((line) => line.scene_id === scene.id);
+        {yamlData.scenes.map((scene, index) => {
+          const lines = yamlData.script.filter((line) => line.scene_id === scene.id);
           const location = locationById.get(scene.location_id);
           const characters = scene.characters.map((id) => characterById.get(id)).filter(Boolean);
 
           return (
-            <article className="scene-card" key={scene.id}>
+            <article className={`scene-card ${scene.id === selectedSceneId ? "selected" : ""}`} key={scene.id}>
               <header className="scene-header">
                 <span className="scene-number">S{index + 1}</span>
                 <div>
