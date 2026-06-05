@@ -155,7 +155,7 @@ script:
 
 ## Demo 视频
 
-Demo 视频链接：待替换。PR-21 会补充最终 demo 说明和检查记录。
+Demo 视频链接和最终检查记录见 `docs/final_check.md`。
 
 ## PR 记录
 
