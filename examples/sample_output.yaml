@@ -1,0 +1,38 @@
+project:
+  title: 雨夜来信
+  version: "1.0"
+  genre: 悬疑短剧
+  logline: 旧影院重逢的一夜，让两个人重新面对十年前错过的答案。
+  source: sample_novel_3chapters.txt
+characters:
+  - id: lin_che
+    name: 林澈
+    role: 男主角
+    description: 带着旧信来到影院门口的人。
+  - id: shen_wei
+    name: 沈微
+    role: 女主角
+    description: 等待多年并递出旧电影票的人。
+locations:
+  - id: old_cinema
+    name: 旧影院门口
+    description: 雨停后的长街尽头，灯箱仍然亮着。
+scenes:
+  - id: scene_1
+    title: 雨夜重逢
+    location_id: old_cinema
+    characters:
+      - lin_che
+      - shen_wei
+    summary: 林澈在旧影院门口见到沈微，并收到十年前的电影票。
+script:
+  - scene_id: scene_1
+    type: action
+    content: 雨停后的长街泛着冷光。林澈握着没有署名的信，停在旧影院门口。
+  - scene_id: scene_1
+    type: dialogue
+    content: 如果今晚不进去，我们会再错过一次。
+    character_id: shen_wei
+  - scene_id: scene_1
+    type: transition
+    content: 镜头推向亮起的银幕。
