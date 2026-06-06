@@ -1,5 +1,14 @@
-import { BookOpenText, Clapperboard, Download, House } from "lucide-react";
-import { useState } from "react";
+import {
+  BadgeCheck,
+  BookOpenText,
+  Clapperboard,
+  Download,
+  House,
+  Moon,
+  Sparkles,
+  Sun,
+} from "lucide-react";
+import { useEffect, useState } from "react";
 
 import Analysis from "../pages/Analysis.jsx";
 import Export from "../pages/Export.jsx";
@@ -8,10 +17,49 @@ import ScriptPreview from "../pages/ScriptPreview.jsx";
 import { chapters as sampleChapters, scriptYaml as sampleScriptYaml } from "./sampleData.js";
 
 const STORAGE_KEY = "scriptwhisper.project";
+const THEME_KEY = "scriptwhisper.theme";
+
+const navItems = [
+  {
+    id: "home",
+    label: "首页",
+    icon: House,
+    title: "ScriptWhisper",
+    description: "AI 小说转剧本的创建入口与工作流总览。",
+  },
+  {
+    id: "analysis",
+    label: "分析",
+    icon: BookOpenText,
+    title: "Novel Analysis",
+    description: "查看章节结构、Story Bible、人物地点和原文证据。",
+  },
+  {
+    id: "preview",
+    label: "预览",
+    icon: Clapperboard,
+    title: "Screenplay Workspace",
+    description: "审阅、标记和编辑按场景生成的剧本正文。",
+  },
+  {
+    id: "export",
+    label: "导出",
+    icon: Download,
+    title: "Export",
+    description: "将结构化剧本导出为 YAML 与 Markdown 文档。",
+  },
+];
 
 export default function App() {
   const [activePage, setActivePage] = useState("home");
   const [project, setProject] = useState(loadInitialProject);
+  const [theme, setTheme] = useState(loadInitialTheme);
+  const page = navItems.find((item) => item.id === activePage) || navItems[0];
+  const sceneCount = project.scriptYaml?.scenes?.length || 0;
+
+  useEffect(() => {
+    window.localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
 
   function updateProject(nextProject) {
     setProject(nextProject);
@@ -34,80 +82,97 @@ export default function App() {
   }
 
   return (
-    <main className="app-shell">
-      <header className="topbar">
-        <div>
-          <p className="eyebrow">ScriptWhisper</p>
-          <h1>{pageTitle(activePage)}</h1>
+    <main className="app-shell" data-theme={theme}>
+      <aside className="app-sidebar">
+        <div className="brand-block">
+          <span className="brand-mark" aria-hidden="true">
+            SW
+          </span>
+          <div>
+            <strong>ScriptWhisper</strong>
+            <span>AI Script Studio</span>
+          </div>
         </div>
-        <nav className="nav-tabs" aria-label="工作台导航">
-          <button
-            className={`nav-tab ${activePage === "home" ? "active" : ""}`}
-            type="button"
-            onClick={() => setActivePage("home")}
-          >
-            <House size={16} />
-            首页
-          </button>
-          <button
-            className={`nav-tab ${activePage === "analysis" ? "active" : ""}`}
-            type="button"
-            onClick={() => setActivePage("analysis")}
-          >
-            <BookOpenText size={16} />
-            分析
-          </button>
-          <button
-            className={`nav-tab ${activePage === "preview" ? "active" : ""}`}
-            type="button"
-            onClick={() => setActivePage("preview")}
-          >
-            <Clapperboard size={16} />
-            预览
-          </button>
-          <button
-            className={`nav-tab ${activePage === "export" ? "active" : ""}`}
-            type="button"
-            onClick={() => setActivePage("export")}
-          >
-            <Download size={16} />
-            导出
-          </button>
+
+        <nav className="sidebar-nav" aria-label="工作台导航">
+          {navItems.map((item) => {
+            const Icon = item.icon;
+            return (
+              <button
+                className={`sidebar-nav-item ${activePage === item.id ? "active" : ""}`}
+                key={item.id}
+                type="button"
+                onClick={() => setActivePage(item.id)}
+              >
+                <Icon size={17} />
+                <span>{item.label}</span>
+              </button>
+            );
+          })}
         </nav>
-      </header>
-      {activePage === "home" && <Home onAnalysisComplete={handleAnalysisComplete} />}
-      {activePage === "analysis" && (
-        <Analysis
-          chapters={project.chapters}
-          issues={project.issues}
-          mockMode={project.mockMode}
-          repaired={project.repaired}
-          scriptYaml={project.scriptYaml}
-        />
-      )}
-      {activePage === "preview" && (
-        <ScriptPreview
-          chapters={project.chapters}
-          onScriptYamlChange={handleScriptYamlChange}
-          scriptYaml={project.scriptYaml}
-        />
-      )}
-      {activePage === "export" && <Export chapters={project.chapters} scriptYaml={project.scriptYaml} />}
+
+        <div className="sidebar-footer">
+          <div className="sidebar-status">
+            <span className="status-dot" aria-hidden="true" />
+            <div>
+              <strong>{project.scriptYaml?.project?.title || "未命名项目"}</strong>
+              <span>{sceneCount} scenes ready</span>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <section className="app-content">
+        <header className="topbar">
+          <div className="topbar-title">
+            <p className="eyebrow">{page.label}</p>
+            <h1>{page.title}</h1>
+            <p>{page.description}</p>
+          </div>
+          <div className="topbar-actions">
+            <span className="status-chip">
+              <Sparkles size={14} />
+              {project.mockMode ? "Mock Mode" : "AI API Mode"}
+            </span>
+            <span className="status-chip">
+              <BadgeCheck size={14} />
+              {project.repaired ? "Auto Repaired" : "Schema Validated"}
+            </span>
+            <button
+              className="icon-button"
+              type="button"
+              aria-label={theme === "dark" ? "切换到浅色主题" : "切换到深色主题"}
+              title={theme === "dark" ? "浅色主题" : "深色主题"}
+              onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
+            >
+              {theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}
+            </button>
+          </div>
+        </header>
+
+        <div className="page-body">
+          {activePage === "home" && <Home onAnalysisComplete={handleAnalysisComplete} />}
+          {activePage === "analysis" && (
+            <Analysis
+              chapters={project.chapters}
+              issues={project.issues}
+              mockMode={project.mockMode}
+              repaired={project.repaired}
+              scriptYaml={project.scriptYaml}
+            />
+          )}
+          {activePage === "preview" && (
+            <ScriptPreview
+              chapters={project.chapters}
+              onScriptYamlChange={handleScriptYamlChange}
+              scriptYaml={project.scriptYaml}
+            />
+          )}
+          {activePage === "export" && <Export chapters={project.chapters} scriptYaml={project.scriptYaml} />}
+        </div>
+      </section>
     </main>
   );
-}
-
-function pageTitle(activePage) {
-  if (activePage === "home") {
-    return "ScriptWhisper";
-  }
-  if (activePage === "preview") {
-    return "剧本预览";
-  }
-  if (activePage === "export") {
-    return "导出";
-  }
-  return "小说分析";
 }
 
 function loadInitialProject() {
@@ -124,6 +189,14 @@ function loadInitialProject() {
     return stored ? { ...fallback, ...JSON.parse(stored) } : fallback;
   } catch {
     return fallback;
+  }
+}
+
+function loadInitialTheme() {
+  try {
+    return window.localStorage.getItem(THEME_KEY) === "dark" ? "dark" : "light";
+  } catch {
+    return "light";
   }
 }
 

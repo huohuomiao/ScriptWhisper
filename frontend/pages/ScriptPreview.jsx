@@ -178,30 +178,33 @@ export default function ScriptPreview({ chapters = sampleChapters, scriptYaml = 
   }
 
   return (
-    <section className="workspace">
-      <ReadingToolbar
-        settings={settings}
-        onClearHighlight={clearCurrentSceneHighlights}
-        onFontSizeChange={setFontSize}
-        onHighlightColorChange={setHighlightColor}
-        onLineHeightChange={setLineHeight}
-      />
-      <SceneEditor
-        onSceneChange={setSelectedSceneId}
-        onYamlChange={handleYamlChange}
-        scriptYaml={yamlData}
-        selectedSceneId={selectedSceneId}
-        showSceneSelect={false}
-      />
+    <section className="workspace preview-workspace">
+      <section className="preview-command-bar">
+        <SceneEditor
+          onSceneChange={setSelectedSceneId}
+          onYamlChange={handleYamlChange}
+          scriptYaml={yamlData}
+          selectedSceneId={selectedSceneId}
+          showSceneSelect={false}
+        />
+        <ReadingToolbar
+          settings={settings}
+          onClearHighlight={clearCurrentSceneHighlights}
+          onFontSizeChange={setFontSize}
+          onHighlightColorChange={setHighlightColor}
+          onLineHeightChange={setLineHeight}
+        />
+      </section>
       {status && <p className="editor-status">{status}</p>}
 
       <div className="preview-layout">
-        <aside className="scene-navigator section-block" aria-label="章节和场景选择">
-          <div className="section-heading">
-            <span className="heading-icon">
-              <ScrollText size={18} />
-            </span>
-            <h2>章节 / 场景</h2>
+        <aside className="scene-navigator panel" aria-label="章节和场景选择">
+          <div className="navigator-header">
+            <div>
+              <p className="eyebrow">Scene Map</p>
+              <h2>章节 / 场景</h2>
+            </div>
+            <ScrollText size={18} />
           </div>
           <div className="chapter-scene-list">
             {sceneGroups.map((group) => (
@@ -212,7 +215,7 @@ export default function ScriptPreview({ chapters = sampleChapters, scriptYaml = 
                   onClick={() => selectChapter(group)}
                 >
                   <strong>{group.title}</strong>
-                  <span>{group.scenes.length} 个场景</span>
+                  <span>{group.scenes.length} scenes</span>
                 </button>
                 <div className="scene-selector-list">
                   {group.scenes.length ? (
@@ -277,18 +280,26 @@ function SceneDetail({
 }) {
   const [editingLineIndex, setEditingLineIndex] = useState(null);
   const [isAddingLine, setIsAddingLine] = useState(false);
+  const [newLineType, setNewLineType] = useState("action");
   const charactersInScene = scene.characters.map((id) => characterById.get(id)).filter(Boolean);
 
   useEffect(() => {
     setEditingLineIndex(null);
     setIsAddingLine(false);
+    setNewLineType("action");
   }, [scene.id]);
+
+  function startAddingLine(type) {
+    setNewLineType(type);
+    setIsAddingLine(true);
+  }
 
   return (
     <article className="scene-card scene-detail-card">
-      <header className="scene-header">
-        <span className="scene-number">S{lineIndex}</span>
-        <div>
+      <header className="scene-header scene-hero-header">
+        <span className="scene-number">S{String(lineIndex).padStart(2, "0")}</span>
+        <div className="scene-title-block">
+          <p className="eyebrow">Current Scene</p>
           <h2>{scene.title}</h2>
           <p>{scene.summary}</p>
         </div>
@@ -307,6 +318,26 @@ function SceneDetail({
 
       <SourceRef scene={scene} />
       <BeatGrid beats={scene.beats} summary={scene.summary} />
+
+      <div className="script-section-header">
+        <div>
+          <p className="eyebrow">Script Lines</p>
+          <h3>{lineEntries.length} 行剧本正文</h3>
+        </div>
+        <div className="script-inline-toolbar" aria-label="添加剧本行">
+          {[
+            ["camera", Camera, "镜头"],
+            ["action", PencilLine, "动作"],
+            ["dialogue", MessageSquareText, "对白"],
+            ["note", StickyNote, "备注"],
+          ].map(([type, Icon, label]) => (
+            <button key={type} type="button" onClick={() => startAddingLine(type)}>
+              <Icon size={14} />
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
 
       <div className={`script-lines ${readingClassName(readingSettings)}`}>
         {lineEntries.length ? (
@@ -347,7 +378,7 @@ function SceneDetail({
         {isAddingLine ? (
           <LineEditorForm
             characters={characters}
-            initialLine={{ scene_id: scene.id, type: "action", content: "" }}
+            initialLine={{ scene_id: scene.id, type: newLineType, content: "" }}
             onCancel={() => setIsAddingLine(false)}
             onSave={(line) => {
               onAddLine(line);
@@ -356,7 +387,7 @@ function SceneDetail({
             submitLabel="添加剧本行"
           />
         ) : (
-          <button className="add-line-button" type="button" onClick={() => setIsAddingLine(true)}>
+          <button className="add-line-button" type="button" onClick={() => startAddingLine("action")}>
             <Plus size={16} />
             添加剧本行
           </button>

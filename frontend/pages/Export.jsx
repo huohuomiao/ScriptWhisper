@@ -34,10 +34,31 @@ export default function Export({ chapters = sampleChapters, scriptYaml = sampleS
   const yamlText = toYaml(exportData);
   const markdownText = toMarkdown(exportData, exportChapters);
   const baseFilename = safeFilename(exportData.project?.title || "ScriptWhisper");
+  const isReady = Object.values(validation).every((item) => item.ok);
 
   return (
-    <section className="workspace">
-      <section className="section-block validation-panel">
+    <section className="workspace export-workspace">
+      <section className="page-intro-panel export-intro">
+        <div>
+          <p className="eyebrow">Structured Output</p>
+          <h2>导出可校验的剧本文档</h2>
+          <p>将当前 ScriptYAML 快照和 Markdown 剧本稿保存为可交付、可继续加工的结构化文件。</p>
+        </div>
+        <span className={`export-ready-badge ${isReady ? "ready" : "blocked"}`}>
+          <ShieldCheck size={15} />
+          {isReady ? "Ready to Export" : "Needs Review"}
+        </span>
+      </section>
+
+      <div className="export-summary-grid" aria-label="导出摘要">
+        <SummaryItem label="Project Title" value={exportData.project?.title || "未命名项目"} />
+        <SummaryItem label="Chapters" value={exportChapters.length} />
+        <SummaryItem label="Scenes" value={(exportData.scenes || []).length} />
+        <SummaryItem label="Script Lines" value={(exportData.script || []).length} />
+        <SummaryItem label="Validation" value={isReady ? "Passed" : "Review"} />
+      </div>
+
+      <section className="panel validation-panel">
         <div className="section-heading">
           <span className="heading-icon">
             <ShieldCheck size={18} />
@@ -51,11 +72,12 @@ export default function Export({ chapters = sampleChapters, scriptYaml = sampleS
           <ValidationItem label="章节来源校验" result={validation.sourceRefs} />
         </div>
       </section>
+
       <div className="export-grid">
         <ExportPanel
           copyLabel="复制 YAML"
           description={`${baseFilename}_ScriptYAML.yaml`}
-          icon={<FileCode2 size={22} />}
+          icon={<FileCode2 size={20} />}
           onDownload={() => downloadText(`${baseFilename}_ScriptYAML.yaml`, yamlText, "text/yaml;charset=utf-8")}
           preview={yamlText}
           title="YAML"
@@ -63,7 +85,7 @@ export default function Export({ chapters = sampleChapters, scriptYaml = sampleS
         <ExportPanel
           copyLabel="复制 Markdown"
           description={`${baseFilename}_剧本预览.md`}
-          icon={<FileText size={22} />}
+          icon={<FileText size={20} />}
           onDownload={() => downloadText(`${baseFilename}_剧本预览.md`, markdownText, "text/markdown;charset=utf-8")}
           preview={markdownText}
           title="Markdown"
@@ -83,7 +105,7 @@ function ExportPanel({ copyLabel, description, icon, onDownload, preview, title 
   }
 
   return (
-    <section className="export-panel">
+    <section className="export-panel code-panel">
       <div className="export-heading">
         <span className="heading-icon">{icon}</span>
         <div>
@@ -92,17 +114,26 @@ function ExportPanel({ copyLabel, description, icon, onDownload, preview, title 
         </div>
         <div className="export-actions">
           <button type="button" onClick={copyPreview}>
-            <Clipboard size={16} />
+            <Clipboard size={15} />
             {copied ? "已复制" : copyLabel}
           </button>
           <button type="button" onClick={onDownload}>
-            <Download size={16} />
+            <Download size={15} />
             下载
           </button>
         </div>
       </div>
       <pre className="export-preview">{preview}</pre>
     </section>
+  );
+}
+
+function SummaryItem({ label, value }) {
+  return (
+    <article className="summary-item">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </article>
   );
 }
 
@@ -164,8 +195,7 @@ function formatScriptLine(scriptLine, content, characterById) {
   const highlightText = highlight ? `【${highlight}】` : "";
   if (scriptLine.type === "dialogue") {
     const character = characterById.get(scriptLine.character_id || scriptLine.speaker_id);
-    const speaker =
-      scriptLine.speaker_name || character?.name || scriptLine.speaker_id || scriptLine.character_id || "未指定";
+    const speaker = scriptLine.speaker_name || character?.name || scriptLine.speaker_id || scriptLine.character_id || "未指定";
     const emotion = scriptLine.emotion ? `（${scriptLine.emotion}）` : "";
     return `**${speaker}**${emotion}：${highlightText}${content}`;
   }
@@ -395,4 +425,14 @@ function safeFilename(value) {
     .trim()
     .replace(/[\\/:*?"<>|]/g, "_")
     .replace(/\s+/g, "_");
+}
+
+function downloadText(filename, text, mimeType) {
+  const blob = new Blob([text], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
 }
