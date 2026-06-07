@@ -38,7 +38,7 @@ async def save_txt_upload(file: UploadFile) -> UploadResponse:
         raise UploadStorageError("Uploaded file is larger than 2 MB.")
 
     try:
-        text = content.decode("utf-8-sig")
+        text = content.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
     except UnicodeDecodeError as exc:
         raise UploadStorageError("Uploaded file must be UTF-8 text.") from exc
     if not text.strip():
