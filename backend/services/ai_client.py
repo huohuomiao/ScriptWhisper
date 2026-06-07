@@ -8,11 +8,17 @@ from typing import Any
 
 import httpx
 
+from backend.schemas.conversion import ConvertRequest, ConvertResponse
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 
 
 class LLMClientError(RuntimeError):
+    pass
+
+
+class AIClientError(RuntimeError):
     pass
 
 
@@ -108,6 +114,56 @@ class LLMClient:
         user_text = next((message["content"] for message in reversed(messages) if message.get("role") == "user"), "")
         preview = user_text.strip().replace("\n", " ")[:120]
         return f"MOCK_RESPONSE: {preview}"
+
+
+class AIClient:
+    def __init__(self, settings: Any):
+        self.settings = settings
+
+    async def convert_to_script(self, payload: ConvertRequest) -> ConvertResponse:
+        has_api_config = bool(self.settings.ai_api_key and self.settings.ai_api_base_url)
+        model = payload.model or self.settings.ai_model
+        if has_api_config and not model:
+            raise AIClientError("AI_MODEL is required when API mode is enabled.")
+
+        client = LLMClient(
+            LLMSettings(
+                api_key=self.settings.ai_api_key,
+                api_base_url=self.settings.ai_api_base_url,
+                model=model,
+                mock_mode=not has_api_config,
+            )
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是专业影视编剧。请把小说片段改写为中文剧本，"
+                    "保留关键剧情、人物动机和场景氛围，输出清晰的场景、动作和对白。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"目标风格：{payload.style}\n\n小说片段：\n{payload.novel_text}",
+            },
+        ]
+
+        try:
+            script = await client.chat(messages, temperature=0.7, mock_response=self._mock_script(payload.novel_text))
+        except LLMClientError as exc:
+            raise AIClientError(str(exc)) from exc
+
+        return ConvertResponse(script=script, provider="mock" if client.mock_mode else "api")
+
+    def _mock_script(self, novel_text: str) -> str:
+        excerpt = novel_text.strip().replace("\n", " ")[:120]
+        return (
+            "场景一  内景  深夜\n\n"
+            "昏黄的灯光落在桌面上。主角停下脚步，望向窗外。\n\n"
+            f"旁白：{excerpt}\n\n"
+            "主角：这一刻，我知道故事必须换一种方式讲出来。\n\n"
+            "镜头缓慢推近，房间里只剩下呼吸声和纸页翻动的声音。"
+        )
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
