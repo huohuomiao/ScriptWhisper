@@ -18,7 +18,7 @@ Demo 视频链接：待上传。
 
 检查时间：2026-06-07
 
-当前 `origin/main` 已合并到 PR #24，包含前端、后端、示例、文档、测试、`.github/workflows/ci.yml` 和 UI 验证脚本。主分支可直接安装依赖、运行测试、构建前端并启动本地演示。
+当前 `origin/main` 已包含 PR #24 的本地工作区同步内容，以及后续合规说明和 CI 锁文件修复。主分支包含前端、后端、示例、文档、测试、`.github/workflows/ci.yml` 和 UI 验证脚本，可直接安装依赖、运行测试、构建前端并启动本地演示。
 
 PR #24 合并前，原本地目录 `D:\work\21ai文本转剧本` 仍显示 4 个未提交修改：`.gitignore`、`frontend/src/styles.css`、`package.json`、`package-lock.json`。PR #24 已纳入这 4 个文件的本地内容；PR #25 之后，当前 main 又额外修复了 `package-lock.json` 的 CI 锁文件问题，因此原目录现在只有 `package-lock.json` 与最新 main 不同，该差异属于 PR #25，不是未上传遗留改动。原目录仍显示这些文件未提交，是因为该目录停留在旧的 `pr-21-demo-final-check` 工作分支。
 
