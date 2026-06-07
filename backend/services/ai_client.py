@@ -58,6 +58,18 @@ class LLMClient:
     def __init__(self, settings: LLMSettings | None = None, transport: httpx.AsyncBaseTransport | None = None):
         self.settings = settings or LLMSettings.from_env()
         self._transport = transport
+        self._client: httpx.AsyncClient | None = None
+
+    async def __aenter__(self) -> "LLMClient":
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     @property
     def mock_mode(self) -> bool:
@@ -89,6 +101,8 @@ class LLMClient:
         try:
             return json.loads(_extract_json_text(content))
         except json.JSONDecodeError as exc:
+            if not content.strip():
+                raise LLMClientError("LLM response is empty; expected JSON.") from exc
             raise LLMClientError("LLM response is not valid JSON.") from exc
 
     async def _chat_async(self, messages: list[dict[str, str]], temperature: float) -> str:
@@ -101,23 +115,24 @@ class LLMClient:
 
     async def _chat_openai_async(self, messages: list[dict[str, str]], temperature: float) -> str:
         endpoint = self.settings.api_base_url.rstrip("/") + "/chat/completions"
+        body: dict[str, Any] = {
+            "model": self.settings.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": self.settings.max_tokens,
+        }
         try:
-            async with httpx.AsyncClient(timeout=self.settings.request_timeout, transport=self._transport) as client:
-                response = await client.post(
-                    endpoint,
-                    headers={
-                        "Authorization": f"Bearer {self.settings.api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": self.settings.model,
-                        "messages": messages,
-                        "temperature": temperature,
-                        "max_tokens": self.settings.max_tokens,
-                    },
-                )
-                response.raise_for_status()
-                payload = response.json()
+            client = self._http_client()
+            response = await client.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {self.settings.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+            )
+            response.raise_for_status()
+            payload = response.json()
         except httpx.HTTPStatusError as exc:
             error_detail = _parse_api_error(exc.response)
             raise LLMClientError(error_detail) from exc
@@ -154,19 +169,19 @@ class LLMClient:
             body["system"] = system_prompt
 
         try:
-            async with httpx.AsyncClient(timeout=self.settings.request_timeout, transport=self._transport) as client:
-                response = await client.post(
-                    endpoint,
-                    headers={
-                        "Authorization": f"Bearer {self.settings.api_key}",
-                        "x-api-key": self.settings.api_key,
-                        "anthropic-version": "2023-06-01",
-                        "Content-Type": "application/json",
-                    },
-                    json=body,
-                )
-                response.raise_for_status()
-                payload = response.json()
+            client = self._http_client()
+            response = await client.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {self.settings.api_key}",
+                    "x-api-key": self.settings.api_key,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+            )
+            response.raise_for_status()
+            payload = response.json()
         except httpx.HTTPStatusError as exc:
             error_detail = _parse_api_error(exc.response)
             raise LLMClientError(error_detail) from exc
@@ -195,6 +210,11 @@ class LLMClient:
         preview = user_text.strip().replace("\n", " ")[:120]
         return f"MOCK_RESPONSE: {preview}"
 
+    def _http_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self.settings.request_timeout, transport=self._transport)
+        return self._client
+
 
 def _load_env_file(path: Path) -> dict[str, str]:
     if not path.exists():
@@ -220,6 +240,21 @@ def _extract_json_text(content: str) -> str:
     if stripped.startswith("```"):
         stripped = stripped.removeprefix("```json").removeprefix("```").strip()
         stripped = stripped.removesuffix("```").strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        return stripped
+
+    object_start = stripped.find("{")
+    array_start = stripped.find("[")
+    starts = [index for index in (object_start, array_start) if index >= 0]
+    if not starts:
+        return stripped
+
+    start = min(starts)
+    object_end = stripped.rfind("}")
+    array_end = stripped.rfind("]")
+    end = max(object_end, array_end)
+    if end > start:
+        return stripped[start : end + 1]
     return stripped
 
 

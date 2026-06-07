@@ -21,12 +21,12 @@ import LanguageSelect from "../components/LanguageSelect.jsx";
 import { convertNovel } from "../src/api.js";
 import { projectDisplayTitle } from "../src/projectStore.jsx";
 
-const MAX_CHAPTERS = 3;
 const progressKeys = [
   "pipeline.step.chapter",
   "pipeline.step.entity",
   "pipeline.step.scene",
   "pipeline.step.script",
+  "pipeline.step.schema",
 ];
 
 const defaultDraft = {
@@ -120,21 +120,8 @@ export default function Home({
       return;
     }
 
-    const availableSlots = Math.max(0, MAX_CHAPTERS - fileRows.length);
-    if (availableSlots === 0) {
-      setStatus(t("home.files.maxWarning"));
-      setStatusType("error");
-      return;
-    }
-
-    if (selectedFiles.length > availableSlots) {
-      setStatus(t("home.files.maxWarning"));
-      setStatusType("error");
-    }
-
-    const acceptedFiles = selectedFiles.slice(0, availableSlots);
     const nextRows = [...fileRows];
-    for (const file of acceptedFiles) {
+    for (const file of selectedFiles) {
       const content = await file.text();
       const chapterIndex = nextChapterIndex(nextRows);
       nextRows.push({
@@ -171,19 +158,22 @@ export default function Home({
     setStatus(t("home.generating"));
     setStatusType("");
     setProgressIndex(0);
-    const progressTimer = window.setInterval(() => {
-      setProgressIndex((current) => (current >= 0 && current < progressKeys.length - 2 ? current + 1 : current));
-    }, 900);
 
     try {
       setStatus(mode === "mock" ? t("home.status.mock") : t("home.status.api"));
-      setProgressIndex(2);
       const result = await convertNovel({
         mock: mode === "mock",
         source,
         targetLanguage,
         text: sourceText,
         title,
+        onProgress: (event) => {
+          setProgressIndex(progressIndexFromEvent(event));
+          const nextStatus = progressStatusFromEvent(event, t);
+          if (nextStatus) {
+            setStatus(nextStatus);
+          }
+        },
       });
       setProgressIndex(progressKeys.length - 1);
       onAnalysisComplete(result, {
@@ -203,7 +193,6 @@ export default function Home({
       setStatus(error.message);
       setStatusType("error");
     } finally {
-      window.clearInterval(progressTimer);
       setIsBusy(false);
     }
   }
@@ -713,6 +702,38 @@ function progressClass(index, progressIndex, statusType) {
   return "progress-step";
 }
 
+function progressIndexFromEvent(event) {
+  if (event.stage === "chapter_parse") {
+    return 0;
+  }
+  if (event.stage === "chapter_generate") {
+    return 3;
+  }
+  if (event.stage === "schema_validate") {
+    return 4;
+  }
+  return 0;
+}
+
+function progressStatusFromEvent(event, t) {
+  if (event.stage === "chapter_parse" && event.type === "stage_complete") {
+    return `${t("pipeline.step.chapter")}完成`;
+  }
+  if (event.stage === "chapter_generate") {
+    const chapter = event.chapter_title || event.chapter_index || event.current;
+    const prefix = `${t("pipeline.step.script")} ${event.current || ""}/${event.total || ""}`;
+    if (event.type === "stage_start") {
+      return `${prefix}：${chapter}`;
+    }
+    const elapsed = event.log?.elapsed_seconds;
+    return `${prefix}完成：${chapter}${elapsed ? `，${elapsed}s` : ""}`;
+  }
+  if (event.stage === "schema_validate") {
+    return event.type === "stage_start" ? t("pipeline.step.schema") : `${t("pipeline.step.schema")}完成`;
+  }
+  return "";
+}
+
 function buildAnalysisRows(data, fileRows, t) {
   const rows = fileRows.map((row) => ({
     ...row,
@@ -785,9 +806,6 @@ function resolveDuplicateRows(rows, resolution) {
 
 function validateRows(rows, t) {
   const messages = [];
-  if (rows.length > MAX_CHAPTERS) {
-    messages.push(t("home.files.maxWarning"));
-  }
   if (rows.some((row) => !Number.isInteger(Number(row.chapterIndex)) || Number(row.chapterIndex) <= 0)) {
     messages.push(t("home.files.positiveWarning"));
   }

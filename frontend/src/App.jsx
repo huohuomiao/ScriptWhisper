@@ -101,6 +101,7 @@ export default function App() {
       mode: runContext.mode,
       repaired: result.repaired,
       scriptYaml: nextYaml,
+      stageLogs: result.stage_logs || [],
       status: "generated",
       title: runContext.title,
       uiState: {

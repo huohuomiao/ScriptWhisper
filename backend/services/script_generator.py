@@ -96,7 +96,7 @@ def _normalize_script_lines(lines: Any, data: ProjectData) -> list[dict[str, Any
             continue
 
         line_type = _normalize_line_type(line.get("type"))
-        content = str(line.get("content") or "").strip()
+        content = str(line.get("content") or line.get("text") or "").strip()
         if not content:
             continue
 
@@ -105,14 +105,22 @@ def _normalize_script_lines(lines: Any, data: ProjectData) -> list[dict[str, Any
             "type": line_type,
             "content": content,
         }
+        for key in ("id", "text", "emotion", "highlight_color", "note", "speaker_name"):
+            if line.get(key):
+                entry[key] = str(line[key])
 
         character_id = line.get("character_id")
+        speaker_id = str(line.get("speaker_id") or "").strip()
+        if speaker_id in character_ids:
+            entry["speaker_id"] = speaker_id
+
         if line_type == "dialogue":
             character_id = _valid_dialogue_character(character_id, scene_id, character_ids, scene_characters)
-            if not character_id:
-                entry["type"] = "action"
-            else:
+            if character_id:
                 entry["character_id"] = character_id
+                entry["speaker_id"] = character_id
+            elif not entry.get("speaker_id") and not entry.get("speaker_name"):
+                entry["type"] = "action"
         elif character_id and character_id in character_ids:
             entry["character_id"] = character_id
 
