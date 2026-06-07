@@ -26,6 +26,22 @@ button {
   cursor: pointer;
 }
 
+select {
+  min-height: 38px;
+  border: 1px solid #cdbfa9;
+  border-radius: 6px;
+  padding: 0 10px;
+  color: #27363c;
+  background: #ffffff;
+  font: inherit;
+}
+
+button:focus-visible,
+select:focus-visible {
+  outline: 3px solid rgb(29 111 122 / 22%);
+  outline-offset: 2px;
+}
+
 .app-shell {
   width: min(1240px, calc(100% - 32px));
   margin: 0 auto;
@@ -245,6 +261,63 @@ td {
   box-shadow: 0 14px 42px rgb(54 44 30 / 7%);
 }
 
+.scene-card.selected {
+  border-color: #1d6f7a;
+}
+
+.scene-editor {
+  border: 1px solid #ded4c5;
+  border-radius: 8px;
+  padding: 18px;
+  background: #fffdf8;
+  box-shadow: 0 14px 42px rgb(54 44 30 / 7%);
+}
+
+.editor-controls {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.editor-controls label {
+  display: grid;
+  gap: 6px;
+  min-width: min(360px, 100%);
+  color: #6b5b44;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.editor-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.editor-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 40px;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 14px;
+  color: #ffffff;
+  background: #1d6f7a;
+}
+
+.editor-actions button:last-child {
+  background: #9b4c32;
+}
+
+.editor-status {
+  margin: -8px 0 0;
+  color: #1d6f7a;
+  font-weight: 700;
+}
+
 .scene-header {
   display: grid;
   grid-template-columns: 46px minmax(0, 1fr);
@@ -375,7 +448,21 @@ td {
   }
 
   .scene-meta,
-  .script-line {
+  .script-line,
+  .editor-controls {
     grid-template-columns: 1fr;
+  }
+
+  .editor-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .editor-actions {
+    justify-content: stretch;
+  }
+
+  .editor-actions button {
+    justify-content: center;
   }
 }
