@@ -259,4 +259,4 @@ Demo 视频链接和最终检查记录见 `docs/final_check.md`。
 | PR-23 | 上传文本换行兼容修复 |
 | PR-24 | 同步本地工作区收尾代码、CI 和 UI 验证脚本 |
 
-说明：GitHub PR #3 的健康检查分支因与后续 main 实现重复，按要求跳过未合并；健康检查功能已保留在当前主分支。PR #24 同步前，本地目录 `D:\work\21ai文本转剧本` 仍显示 `.gitignore`、`frontend/src/styles.css`、`package.json`、`package-lock.json` 4 个未提交修改。已将这 4 个文件与当前 `origin/main` 对比，内容无差异，说明它们已经通过 PR #24 合并，不属于仍未上传的遗留改动。
+说明：GitHub PR #3 的健康检查分支因与后续 main 实现重复，按要求跳过未合并；健康检查功能已保留在当前主分支。PR #24 同步前，本地目录 `D:\work\21ai文本转剧本` 仍显示 `.gitignore`、`frontend/src/styles.css`、`package.json`、`package-lock.json` 4 个未提交修改。PR #24 已纳入这 4 个文件的本地内容；PR #25 之后，当前 main 又额外修复了 `package-lock.json` 的 CI 锁文件问题，因此原目录现在只有 `package-lock.json` 与最新 main 不同，该差异属于 PR #25，不是未上传遗留改动。
