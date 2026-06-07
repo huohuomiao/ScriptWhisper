@@ -11,11 +11,11 @@ export async function uploadNovelFile(file) {
 }
 
 
-export async function convertNovel({ text, title, source, mock }) {
+export async function convertNovel({ text, title, source, mock, targetLanguage = "zh" }) {
   return requestJson("/api/convert", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, title, source, mock }),
+    body: JSON.stringify({ text, title, source, mock, target_language: targetLanguage }),
   });
 }
 

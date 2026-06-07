@@ -1,132 +1,182 @@
 import { CheckCircle2, Clipboard, Download, FileCode2, FileText, ShieldCheck } from "lucide-react";
-import { useMemo, useState } from "react";
-
-import { chapters as sampleChapters, scriptYaml as sampleScriptYaml } from "../src/sampleData.js";
+import { memo, useMemo, useState } from "react";
 
 const highlightLabels = {
-  "#fff3a3": "黄色标记",
-  "#cfe8ff": "蓝色标记",
-  "#d8f5d2": "绿色标记",
-  "#ffd8d2": "红色标记",
-  yellow: "黄色标记",
-  blue: "蓝色标记",
-  green: "绿色标记",
-  red: "红色标记",
+  "#fff3a3": "preview.color.yellowMark",
+  "#cfe8ff": "preview.color.blueMark",
+  "#d8f5d2": "preview.color.greenMark",
+  "#ffd8d2": "preview.color.redMark",
+  yellow: "preview.color.yellowMark",
+  blue: "preview.color.blueMark",
+  green: "preview.color.greenMark",
+  red: "preview.color.redMark",
+  purple: "preview.color.purpleMark",
 };
 
 const typeLabels = {
-  action: "动作",
-  camera: "镜头",
-  dialogue: "对白",
-  narration: "旁白",
-  note: "备注",
-  transition: "转场",
+  action: "preview.filter.action",
+  camera: "preview.filter.camera",
+  dialogue: "preview.filter.dialogue",
+  narration: "preview.filter.narration",
+  note: "preview.filter.note",
+  transition: "preview.filter.transition",
 };
 
-export default function Export({ chapters = sampleChapters, scriptYaml = sampleScriptYaml }) {
+const EMPTY_ANNOTATIONS = [];
+
+export default function Export({ chapters = [], currentProject = null, scriptYaml = emptyScriptYaml(), t = (key) => key }) {
+  const [activeFormat, setActiveFormat] = useState("yaml");
+  const [copiedFormat, setCopiedFormat] = useState("");
+  const [includeChapterNotes, setIncludeChapterNotes] = useState(true);
   const normalizedChapters = useMemo(() => normalizeChapters(chapters), [chapters]);
   const exportData = useMemo(() => sanitizeForExport(scriptYaml, normalizedChapters), [scriptYaml, normalizedChapters]);
   const exportChapters = useMemo(
     () => (normalizedChapters.length ? normalizedChapters : chaptersFromScenes(exportData.scenes || [])),
     [exportData, normalizedChapters],
   );
-  const validation = useMemo(() => validateScriptYaml(exportData, exportChapters), [exportData, exportChapters]);
-  const yamlText = toYaml(exportData);
-  const markdownText = toMarkdown(exportData, exportChapters);
+  const validation = useMemo(() => validateScriptYaml(exportData, exportChapters, t), [exportData, exportChapters, t]);
+  const chapterAnnotations = currentProject?.chapterAnnotations || EMPTY_ANNOTATIONS;
+  const markdownAnnotations = includeChapterNotes ? chapterAnnotations : EMPTY_ANNOTATIONS;
+  const yamlText = useMemo(() => (activeFormat === "yaml" ? toYaml(exportData) : ""), [activeFormat, exportData]);
+  const markdownText = useMemo(
+    () => (activeFormat === "markdown" ? toMarkdown(exportData, exportChapters, t, markdownAnnotations) : ""),
+    [activeFormat, exportChapters, exportData, markdownAnnotations, t],
+  );
+  const activeOutputText = activeFormat === "markdown" ? markdownText : yamlText;
   const baseFilename = safeFilename(exportData.project?.title || "ScriptWhisper");
   const isReady = Object.values(validation).every((item) => item.ok);
+  const outputs = useMemo(() => [
+    {
+      id: "yaml",
+      copyLabel: t("export.copyYaml"),
+      description: `${baseFilename}_ScriptYAML.yaml`,
+      icon: FileCode2,
+      label: "YAML",
+      mimeType: "text/yaml;charset=utf-8",
+    },
+    {
+      id: "markdown",
+      copyLabel: t("export.copyMarkdown"),
+      description: `${baseFilename}_剧本预览.md`,
+      icon: FileText,
+      label: "Markdown",
+      mimeType: "text/markdown;charset=utf-8",
+    },
+  ], [baseFilename, t]);
+  const activeOutput = useMemo(() => {
+    const definition = outputs.find((output) => output.id === activeFormat) || outputs[0];
+    return { ...definition, text: activeOutputText };
+  }, [activeFormat, activeOutputText, outputs]);
 
-  return (
-    <section className="workspace export-workspace">
-      <section className="page-intro-panel export-intro">
-        <div>
-          <p className="eyebrow">Structured Output</p>
-          <h2>导出可校验的剧本文档</h2>
-          <p>将当前 ScriptYAML 快照和 Markdown 剧本稿保存为可交付、可继续加工的结构化文件。</p>
-        </div>
-        <span className={`export-ready-badge ${isReady ? "ready" : "blocked"}`}>
-          <ShieldCheck size={15} />
-          {isReady ? "Ready to Export" : "Needs Review"}
-        </span>
+  async function copyActiveOutput() {
+    await navigator.clipboard.writeText(activeOutput.text);
+    setCopiedFormat(activeOutput.id);
+    window.setTimeout(() => setCopiedFormat(""), 1400);
+  }
+
+  function downloadActiveOutput() {
+    downloadText(activeOutput.description, activeOutput.text, activeOutput.mimeType);
+  }
+
+  if (!currentProject) {
+    return (
+      <section className="workspace export-workspace">
+        <p className="empty-state">{t("export.empty")}</p>
       </section>
-
-      <div className="export-summary-grid" aria-label="导出摘要">
-        <SummaryItem label="Project Title" value={exportData.project?.title || "未命名项目"} />
-        <SummaryItem label="Chapters" value={exportChapters.length} />
-        <SummaryItem label="Scenes" value={(exportData.scenes || []).length} />
-        <SummaryItem label="Script Lines" value={(exportData.script || []).length} />
-        <SummaryItem label="Validation" value={isReady ? "Passed" : "Review"} />
-      </div>
-
-      <section className="panel validation-panel">
-        <div className="section-heading">
-          <span className="heading-icon">
-            <ShieldCheck size={18} />
-          </span>
-          <h2>导出校验</h2>
-        </div>
-        <div className="validation-grid">
-          <ValidationItem label="Schema 状态" result={validation.schema} />
-          <ValidationItem label="人物 ID 校验" result={validation.characters} />
-          <ValidationItem label="地点 ID 校验" result={validation.locations} />
-          <ValidationItem label="章节来源校验" result={validation.sourceRefs} />
-        </div>
-      </section>
-
-      <div className="export-grid">
-        <ExportPanel
-          copyLabel="复制 YAML"
-          description={`${baseFilename}_ScriptYAML.yaml`}
-          icon={<FileCode2 size={20} />}
-          onDownload={() => downloadText(`${baseFilename}_ScriptYAML.yaml`, yamlText, "text/yaml;charset=utf-8")}
-          preview={yamlText}
-          title="YAML"
-        />
-        <ExportPanel
-          copyLabel="复制 Markdown"
-          description={`${baseFilename}_剧本预览.md`}
-          icon={<FileText size={20} />}
-          onDownload={() => downloadText(`${baseFilename}_剧本预览.md`, markdownText, "text/markdown;charset=utf-8")}
-          preview={markdownText}
-          title="Markdown"
-        />
-      </div>
-    </section>
-  );
-}
-
-function ExportPanel({ copyLabel, description, icon, onDownload, preview, title }) {
-  const [copied, setCopied] = useState(false);
-
-  async function copyPreview() {
-    await navigator.clipboard.writeText(preview);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1400);
+    );
   }
 
   return (
-    <section className="export-panel code-panel">
-      <div className="export-heading">
-        <span className="heading-icon">{icon}</span>
-        <div>
-          <h2>{title}</h2>
-          <p>{description}</p>
+    <section className="workspace export-workspace">
+      <section className="delivery-toolbar panel" aria-label={t("export.summaryAria")}>
+        <div className="delivery-status">
+          <span className={`export-ready-badge ${isReady ? "ready" : "blocked"}`}>
+            <ShieldCheck size={15} />
+            {isReady ? t("export.ready") : t("export.needsReview")}
+          </span>
+          <div>
+            <strong>{t("export.title")}</strong>
+            <span>{activeOutput.description}</span>
+          </div>
         </div>
-        <div className="export-actions">
-          <button type="button" onClick={copyPreview}>
+        <div className="delivery-actions">
+          <button type="button" onClick={copyActiveOutput}>
             <Clipboard size={15} />
-            {copied ? "已复制" : copyLabel}
+            {copiedFormat === activeOutput.id ? t("export.copied") : activeOutput.copyLabel}
           </button>
-          <button type="button" onClick={onDownload}>
+          <button className="primary" type="button" onClick={downloadActiveOutput}>
             <Download size={15} />
-            下载
+            {t("export.download")}
           </button>
         </div>
+      </section>
+
+      <section className="validation-strip" aria-label={t("export.validation")}>
+        <ValidationPill label={t("export.schemaStatus")} result={validation.schema} t={t} />
+        <ValidationPill label={t("export.characterCheck")} result={validation.characters} t={t} />
+        <ValidationPill label={t("export.locationCheck")} result={validation.locations} t={t} />
+        <ValidationPill label={t("export.sourceCheck")} result={validation.sourceRefs} t={t} />
+      </section>
+
+      <div className="export-workbench-grid">
+        <aside className="delivery-side-panel panel">
+          <p className="eyebrow">{t("export.overline")}</p>
+          <div className="delivery-summary-list">
+            <SummaryItem label={t("home.field.title")} value={exportData.project?.title || t("app.project.untitled")} />
+            <SummaryItem label={t("analysis.metric.chapters")} value={exportChapters.length} />
+            <SummaryItem label={t("analysis.metric.scenes")} value={(exportData.scenes || []).length} />
+            <SummaryItem label={t("export.scriptLines")} value={(exportData.script || []).length} />
+          </div>
+          <label className="export-note-toggle">
+            <input checked={includeChapterNotes} type="checkbox" onChange={(event) => setIncludeChapterNotes(event.target.checked)} />
+            {t("export.includeNotes")}
+          </label>
+        </aside>
+
+        <section className="export-output-panel panel">
+          <div className="export-output-tabs" role="tablist" aria-label="Export formats">
+            {outputs.map((output) => {
+              const Icon = output.icon;
+              return (
+                <button
+                  className={activeFormat === output.id ? "active" : ""}
+                  key={output.id}
+                  role="tab"
+                  type="button"
+                  aria-selected={activeFormat === output.id}
+                  onClick={() => setActiveFormat(output.id)}
+                >
+                  <Icon size={15} />
+                  {output.label}
+                </button>
+              );
+            })}
+          </div>
+          <CodePreviewPanel output={activeOutput} />
+        </section>
       </div>
-      <pre className="export-preview">{preview}</pre>
     </section>
   );
 }
+
+const CodePreviewPanel = memo(function CodePreviewPanel({ output }) {
+  const Icon = output.icon;
+
+  return (
+    <section className="code-panel export-code-view">
+      <div className="export-heading">
+        <span className="heading-icon">
+          <Icon size={20} />
+        </span>
+        <div>
+          <h2>{output.label}</h2>
+          <p>{output.description}</p>
+        </div>
+      </div>
+      <pre className="export-preview">{output.text}</pre>
+    </section>
+  );
+});
 
 function SummaryItem({ label, value }) {
   return (
@@ -137,10 +187,20 @@ function SummaryItem({ label, value }) {
   );
 }
 
-function toMarkdown(data, chapters) {
+function ValidationPill({ label, result, t }) {
+  return (
+    <article className={`validation-pill ${result.ok ? "valid" : "invalid"}`} title={result.ok ? t("export.pass") : result.message}>
+      <CheckCircle2 size={16} />
+      <strong>{label}</strong>
+      <span>{result.ok ? t("export.pass") : result.message}</span>
+    </article>
+  );
+}
+
+function toMarkdown(data, chapters, t, chapterAnnotations = []) {
   const characterById = new Map((data.characters || []).map((character) => [character.id, character]));
   const locationById = new Map((data.locations || []).map((location) => [location.id, location]));
-  const lines = [`# ${data.project?.title || "未指定"}`, ""];
+  const lines = [`# ${data.project?.title || t("app.project.untitled")}`, ""];
   if (data.project?.logline) {
     lines.push(`> ${data.project.logline}`, "");
   }
@@ -149,7 +209,7 @@ function toMarkdown(data, chapters) {
     const chapterScenes = (data.scenes || []).filter((scene) => scene.source_ref?.chapter_id === chapter.id);
     lines.push(`## ${chapter.title}`, "");
     if (!chapterScenes.length) {
-      lines.push("当前章节还没有生成场景。", "");
+      lines.push(t("preview.noScenesForChapter"), "");
       continue;
     }
 
@@ -160,16 +220,16 @@ function toMarkdown(data, chapters) {
       if (scene.summary) {
         lines.push(scene.summary, "");
       }
-      lines.push(`- 来源章节：${scene.source_ref?.chapter_title || chapter.title}`);
+      lines.push(`- ${t("preview.sourceEvidence")}：${scene.source_ref?.chapter_title || chapter.title}`);
       if (scene.source_ref?.excerpt) {
-        lines.push(`- 原文依据：${scene.source_ref.excerpt}`);
+        lines.push(`- ${t("analysis.sourceEvidence")}：${scene.source_ref.excerpt}`);
       }
       if (location || scene.location_id) {
-        lines.push(`- 地点：${location?.name || scene.location_id}`);
+        lines.push(`- ${t("preview.location")}：${location?.name || scene.location_id}`);
       }
       const characterNames = (scene.characters || []).map((id) => characterById.get(id)?.name || id).filter(Boolean);
       if (characterNames.length) {
-        lines.push(`- 人物：${characterNames.join(" / ")}`);
+        lines.push(`- ${t("preview.characters")}：${characterNames.join(" / ")}`);
       }
       lines.push("");
 
@@ -178,35 +238,54 @@ function toMarkdown(data, chapters) {
         if (!content) {
           continue;
         }
-        lines.push(formatScriptLine(scriptLine, content, characterById));
+        lines.push(formatScriptLine(scriptLine, content, characterById, t));
         if (scriptLine.note) {
-          lines.push(`> 备注：${scriptLine.note}`);
+          lines.push(`> ${t("preview.editor.note")}：${scriptLine.note}`);
         }
         lines.push("");
       }
     }
   }
 
+  const notes = (chapterAnnotations || []).filter((annotation) => annotation.note);
+  if (notes.length) {
+    lines.push(`## ${t("analysis.notes")}`, "");
+    for (const note of notes) {
+      const chapter = chapters.find((item) => item.id === note.chapterId);
+      if (!chapter) {
+        continue;
+      }
+      const selectedText = note.selectedText ? ` / ${t("analysis.selectedText")}：${note.selectedText}` : "";
+      lines.push(`- ${chapter.title} / ${t("analysis.paragraphIndex", { index: note.paragraphIndex })}${selectedText}：${note.note}`);
+    }
+    lines.push("");
+  }
+
   return lines.join("\n").trim() + "\n";
 }
 
-function formatScriptLine(scriptLine, content, characterById) {
-  const highlight = highlightLabel(scriptLine.highlight_color);
+function formatScriptLine(scriptLine, content, characterById, t) {
+  const highlight = highlightLabel(getLineHighlightColor(scriptLine), t);
   const highlightText = highlight ? `【${highlight}】` : "";
   if (scriptLine.type === "dialogue") {
     const character = characterById.get(scriptLine.character_id || scriptLine.speaker_id);
-    const speaker = scriptLine.speaker_name || character?.name || scriptLine.speaker_id || scriptLine.character_id || "未指定";
+    const speaker = scriptLine.speaker_name || character?.name || scriptLine.speaker_id || scriptLine.character_id || t("preview.unassigned");
     const emotion = scriptLine.emotion ? `（${scriptLine.emotion}）` : "";
     return `**${speaker}**${emotion}：${highlightText}${content}`;
   }
-  return `_${typeLabels[scriptLine.type] || scriptLine.type}_：${highlightText}${content}`;
+  return `_${t(typeLabels[scriptLine.type] || scriptLine.type)}_：${highlightText}${content}`;
 }
 
-function highlightLabel(value) {
+function getLineHighlightColor(line) {
+  return Object.prototype.hasOwnProperty.call(line, "highlight_color") ? line.highlight_color : line.highlightColor;
+}
+
+function highlightLabel(value, t) {
   if (!value) {
     return "";
   }
-  return highlightLabels[String(value).trim().toLowerCase()] || `${value}标记`;
+  const labelKey = highlightLabels[String(value).trim().toLowerCase()];
+  return labelKey ? t(labelKey) : t("preview.color.genericMark", { color: value });
 }
 
 function toYaml(value) {
@@ -279,7 +358,22 @@ function formatScalar(value) {
 }
 
 function sanitizeForExport(value, chapters) {
-  return repairSourceRefs(removeEmptyFields(value), chapters);
+  return repairSourceRefs(normalizeExportScript(removeEmptyFields(value)), chapters);
+}
+
+function normalizeExportScript(value) {
+  const data = structuredClone(value || emptyScriptYaml());
+  data.script = (data.script || []).map((line) => {
+    const nextLine = { ...line };
+    const highlightColor = getLineHighlightColor(nextLine);
+    delete nextLine.highlight_color;
+    delete nextLine.highlightColor;
+    if (highlightColor) {
+      nextLine.highlightColor = highlightColor;
+    }
+    return nextLine;
+  });
+  return data;
 }
 
 function repairSourceRefs(value, chapters) {
@@ -367,7 +461,7 @@ function isEmptyExportValue(value) {
   );
 }
 
-function validateScriptYaml(data, chapters) {
+function validateScriptYaml(data, chapters, t) {
   const characters = data.characters || [];
   const locations = data.locations || [];
   const scenes = data.scenes || [];
@@ -394,27 +488,27 @@ function validateScriptYaml(data, chapters) {
     },
     characters: {
       ok: sceneCharacterIssues.length === 0,
-      message: sceneCharacterIssues.length ? sceneCharacterIssues.join("；") : "场景人物引用有效",
+      message: sceneCharacterIssues.length ? sceneCharacterIssues.join("；") : t("export.charactersValid"),
     },
     locations: {
       ok: locationIssues.length === 0 && scriptIssues.length === 0,
       message:
-        locationIssues.length || scriptIssues.length ? [...locationIssues, ...scriptIssues].join("；") : "地点与场景引用有效",
+        locationIssues.length || scriptIssues.length ? [...locationIssues, ...scriptIssues].join("；") : t("export.locationsValid"),
     },
     sourceRefs: {
       ok: sourceIssues.length === 0,
-      message: sourceIssues.length ? sourceIssues.join("；") : "章节来源引用有效",
+      message: sourceIssues.length ? sourceIssues.join("；") : t("export.sourcesValid"),
     },
   };
 }
 
-function ValidationItem({ label, result }) {
+function ValidationItem({ label, result, t }) {
   return (
     <article className={`validation-item ${result.ok ? "valid" : "invalid"}`}>
       <CheckCircle2 size={18} />
       <div>
         <h3>{label}</h3>
-        <p>{result.ok ? "通过" : result.message}</p>
+        <p>{result.ok ? t("export.pass") : result.message}</p>
       </div>
     </article>
   );
@@ -435,4 +529,14 @@ function downloadText(filename, text, mimeType) {
   link.download = filename;
   link.click();
   URL.revokeObjectURL(url);
+}
+
+function emptyScriptYaml() {
+  return {
+    project: {},
+    characters: [],
+    locations: [],
+    scenes: [],
+    script: [],
+  };
 }

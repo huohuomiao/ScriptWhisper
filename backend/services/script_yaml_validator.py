@@ -126,7 +126,14 @@ def _repair_project(value: Any, issues: list[str]) -> dict[str, Any]:
     for key in ("genre", "logline", "source"):
         if project.get(key):
             repaired[key] = str(project[key])
+    repaired["source_language"] = str(project.get("source_language") or "zh")
+    repaired["target_language"] = _normalize_target_language(project.get("target_language"))
     return repaired
+
+
+def _normalize_target_language(value: Any) -> str:
+    language = str(value or "zh").strip().lower()
+    return language if language in {"zh", "en", "fr", "ja", "ru"} else "zh"
 
 
 def _repair_named_items(

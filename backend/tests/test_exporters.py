@@ -25,6 +25,7 @@ def test_markdown_export_groups_by_chapter_and_omits_empty_fields() -> None:
     assert "## 第二章 旧影院" in markdown
     assert "### S2 银幕亮起" in markdown
     assert "【黄色标记】这句对白需要加强冲突" in markdown
+    assert "【紫色标记】镜头推近银幕。" in markdown
     assert "> 备注：这里需要停顿。" in markdown
     assert "null" not in markdown
     assert "None" not in markdown
@@ -89,6 +90,7 @@ def _editable_script_yaml() -> dict:
                 "scene_id": "scene_2",
                 "type": "camera",
                 "content": "镜头推近银幕。",
+                "highlight_color": "purple",
                 "note": "",
             },
         ],

@@ -33,6 +33,7 @@ async def convert_novel(payload: ConvertRequest) -> ApiResponse:
             title=payload.title,
             source=payload.source,
             mock=payload.mock,
+            target_language=payload.target_language,
         )
         return success_response(result, "Novel converted.")
     except LLMClientError as exc:

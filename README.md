@@ -138,14 +138,19 @@ VITE_API_BASE_URL=http://127.0.0.1:8000
 
 ## AI 配置
 
-项目通过 `.env` 读取 OpenAI-compatible API 配置：
+项目通过 `.env` 读取 AI API 配置，支持 OpenAI-compatible 和 Anthropic/Claude-compatible 两种协议：
 
 ```env
 AI_API_KEY=your_api_key_here
-AI_API_BASE_URL=https://api.example.com/v1
-AI_MODEL=your-model-name
+AI_API_BASE_URL=https://token-plan-cn.xiaomimimo.com/v1
+AI_API_PROTOCOL=openai
+AI_MODEL=mimo-v2.5-pro
+AI_MAX_TOKENS=4096
+AI_REQUEST_TIMEOUT_SECONDS=120
 AI_MOCK_MODE=false
 ```
+
+如果使用 OpenAI-compatible 接口，把 `AI_API_PROTOCOL` 改为 `openai`，并将 `AI_API_BASE_URL` 设置为类似 `https://api.example.com/v1` 的地址。
 
 如果缺少 `AI_API_KEY`、`AI_API_BASE_URL` 或 `AI_MODEL`，系统会自动进入 mock 模式，便于本地开发和测试。
 

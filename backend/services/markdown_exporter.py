@@ -15,6 +15,7 @@ HIGHLIGHT_LABELS = {
     "blue": "蓝色标记",
     "green": "绿色标记",
     "red": "红色标记",
+    "purple": "紫色标记",
 }
 
 TYPE_LABELS = {

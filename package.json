@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite frontend --host 0.0.0.0",
     "build": "vite build frontend",
-    "preview": "vite preview frontend --host 0.0.0.0"
+    "preview": "vite preview frontend --host 0.0.0.0",
+    "playwright:install": "playwright install chromium",
+    "verify:ui": "node tools/verify-ui.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.561.0",
@@ -14,6 +16,7 @@
     "react-dom": "^19.2.7"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "@vitejs/plugin-react": "^6.0.2",
     "vite": "^8.0.16"
   }
