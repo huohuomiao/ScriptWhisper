@@ -3,10 +3,11 @@ import { useEffect, useState } from "react";
 const STORAGE_KEY = "scriptwhisper.readingSettings";
 
 export const highlightColors = [
-  { id: "yellow", label: "黄色", value: "#fff3a3" },
-  { id: "blue", label: "蓝色", value: "#cfe8ff" },
-  { id: "green", label: "绿色", value: "#d8f5d2" },
-  { id: "red", label: "红色", value: "#ffd8d2" },
+  { id: "yellow", label: "黄色", value: "#f6c453" },
+  { id: "blue", label: "蓝色", value: "#4c7dff" },
+  { id: "green", label: "绿色", value: "#35b779" },
+  { id: "red", label: "红色", value: "#ef6a5b" },
+  { id: "purple", label: "紫色", value: "#8b5cf6" },
 ];
 
 const defaultSettings = {
@@ -41,7 +42,7 @@ export function readingClassName(settings) {
 }
 
 export function selectedHighlightValue(settings) {
-  return highlightColors.find((color) => color.id === settings.highlightColor)?.value || highlightColors[0].value;
+  return highlightColors.find((color) => color.id === settings.highlightColor)?.id || highlightColors[0].id;
 }
 
 function loadReadingSettings() {

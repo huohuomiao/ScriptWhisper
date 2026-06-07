@@ -3,6 +3,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 ScriptLineType = Literal["action", "dialogue", "transition", "note", "camera", "narration"]
+TargetLanguage = Literal["zh", "en", "fr", "ja", "ru"]
 
 
 class ProjectInfo(BaseModel):
@@ -13,8 +14,10 @@ class ProjectInfo(BaseModel):
     genre: str | None = None
     logline: str | None = None
     source: str | None = None
+    source_language: str = "zh"
+    target_language: TargetLanguage = "zh"
 
-    @field_validator("genre", "logline", "source", mode="before")
+    @field_validator("genre", "logline", "source", "source_language", mode="before")
     @classmethod
     def normalize_optional_text(cls, value: Any) -> str | None:
         if value is None:
@@ -96,6 +99,15 @@ class ScriptLine(BaseModel):
     emotion: str | None = None
     highlight_color: str | None = None
     note: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_camel_case_highlight(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "highlightColor" in value and "highlight_color" not in value:
+            normalized = dict(value)
+            normalized["highlight_color"] = normalized.pop("highlightColor")
+            return normalized
+        return value
 
     @model_validator(mode="after")
     def validate_dialogue_character(self) -> "ScriptLine":

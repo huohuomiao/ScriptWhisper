@@ -37,10 +37,19 @@ def _script_messages(project_data: ProjectData) -> list[dict[str, str]]:
                 "{\"script\":[{\"scene_id\":\"\",\"type\":\"action|dialogue|transition|note\","
                 "\"character_id\":\"可选\",\"content\":\"\"}]}。"
                 "对白必须提供 character_id；镜头提示使用 type=note。"
+                + _target_language_instruction(project_data)
             ),
         },
         {"role": "user", "content": f"ScriptYAML 项目数据：{project_data}"},
     ]
+
+
+def _target_language_instruction(project_data: ProjectData) -> str:
+    language = str(project_data.get("project", {}).get("target_language") or "zh")
+    return (
+        "请使用所选目标语言输出人物描述、地点描述、场景摘要、剧情节拍、动作、对白、镜头和导出文本。"
+        f"当前 target_language={language}。"
+    )
 
 
 def _ensure_script_yaml_base(project_data: ProjectData) -> ProjectData:

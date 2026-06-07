@@ -4,6 +4,7 @@
 node_modules/
 frontend/dist/
 frontend/.vite/
+artifacts/
 backend/uploads/*
 !backend/uploads/.gitkeep
 __pycache__/

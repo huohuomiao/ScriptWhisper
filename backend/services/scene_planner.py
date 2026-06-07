@@ -40,6 +40,7 @@ def _scene_messages(chapter_text: str, project_data: ProjectData) -> list[dict[s
                 "{\"scenes\":[{\"title\":\"\",\"location_id\":\"\",\"characters\":[],\"summary\":\"\"}]}。"
                 "location_id 必须来自项目地点；characters 必须来自项目人物 ID。"
                 "Do not output source_ref, chapter_id or chapter_index; the backend will attach chapter source data."
+                + _target_language_instruction(project_data)
             ),
         },
         {
@@ -47,6 +48,14 @@ def _scene_messages(chapter_text: str, project_data: ProjectData) -> list[dict[s
             "content": f"项目数据：{project_data}\n\n章节文本：\n{chapter_text}",
         },
     ]
+
+
+def _target_language_instruction(project_data: ProjectData) -> str:
+    language = str(project_data.get("project", {}).get("target_language") or "zh")
+    return (
+        "请使用所选目标语言输出人物描述、地点描述、场景摘要、剧情节拍、动作、对白、镜头和导出文本。"
+        f"当前 target_language={language}。"
+    )
 
 
 def _ensure_scene_data(project_data: ProjectData) -> ProjectData:

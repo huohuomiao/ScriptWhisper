@@ -17,6 +17,7 @@ async def convert_novel_text(
     title: str | None = None,
     source: str | None = None,
     mock: bool | None = None,
+    target_language: str = "zh",
 ) -> ConvertResponse:
     stripped_text = text.strip()
     chapters = parse_chapters(stripped_text)
@@ -31,6 +32,9 @@ async def convert_novel_text(
             api_base_url=settings.api_base_url,
             model=settings.model,
             mock_mode=mock,
+            api_protocol=settings.api_protocol,
+            max_tokens=settings.max_tokens,
+            request_timeout=settings.request_timeout,
         )
     client = LLMClient(settings)
 
@@ -38,6 +42,8 @@ async def convert_novel_text(
         "project": {
             "title": (title or _title_from_chapters(chapters) or "Untitled").strip(),
             "source": source,
+            "source_language": "zh",
+            "target_language": _normalize_target_language(target_language),
         },
         "characters": [],
         "locations": [],
@@ -64,6 +70,11 @@ async def convert_novel_text(
         issues=result.issues,
         mock_mode=client.mock_mode,
     )
+
+
+def _normalize_target_language(value: str | None) -> str:
+    language = (value or "zh").strip().lower()
+    return language if language in {"zh", "en", "fr", "ja", "ru"} else "zh"
 
 
 def _single_chapter(text: str, title: str | None) -> Chapter:

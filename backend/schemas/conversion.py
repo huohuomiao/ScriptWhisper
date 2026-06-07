@@ -10,6 +10,7 @@ class ConvertRequest(BaseModel):
     title: str | None = None
     source: str | None = None
     mock: bool | None = None
+    target_language: Literal["zh", "en", "fr", "ja", "ru"] = "zh"
 
 
 class ChapterResponse(BaseModel):

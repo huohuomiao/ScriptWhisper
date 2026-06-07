@@ -3,7 +3,14 @@ import { useEffect, useState } from "react";
 
 import { polishScene } from "../src/api.js";
 
-export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange, onYamlChange, showSceneSelect = true }) {
+export default function SceneEditor({
+  scriptYaml,
+  selectedSceneId,
+  onSceneChange,
+  onYamlChange,
+  showSceneSelect = true,
+  t = (key) => key,
+}) {
   const explicitScene = scriptYaml.scenes.find((item) => item.id === selectedSceneId);
   const scene = explicitScene || (showSceneSelect ? scriptYaml.scenes[0] : null);
   const [isBusy, setIsBusy] = useState(false);
@@ -18,20 +25,20 @@ export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange
 
   if (!scene) {
     return (
-      <section className="scene-editor" aria-label="单场景润色">
+      <section className="scene-editor" aria-label={t("sceneEditor.title")}>
         <div className="section-heading">
           <span className="heading-icon">
             <Zap size={18} />
           </span>
-          <h2>单场景润色</h2>
+          <h2>{t("sceneEditor.title")}</h2>
         </div>
-        <p className="empty-state compact">当前章节还没有生成场景。</p>
+        <p className="empty-state compact">{t("preview.noScenesForChapter")}</p>
       </section>
     );
   }
 
   function applyConflictBoost() {
-    updateScene("conflict", "强化冲突", (draft) => {
+    updateScene("conflict", t("sceneEditor.boostConflict"), (draft) => {
       const targetScene = draft.scenes.find((item) => item.id === scene.id);
       targetScene.summary = `${targetScene.summary || targetScene.title} 双方目标更明确，场面压力升级。`;
       draft.script.push({
@@ -48,8 +55,8 @@ export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange
   }
 
   function applyDialogueRewrite() {
-    updateScene("dialogue", hasDialogue ? "修改对白" : "添加对白", (draft) => {
-      const sceneCharacters = scene.characters;
+    updateScene("dialogue", hasDialogue ? t("sceneEditor.rewriteDialogue") : t("sceneEditor.addDialogue"), (draft) => {
+      const sceneCharacters = scene.characters || [];
       const fallbackCharacterId = sceneCharacters[0] || draft.characters[0]?.id;
       const dialogue = draft.script.find((line) => line.scene_id === scene.id && line.type === "dialogue");
 
@@ -94,7 +101,10 @@ export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange
   }
 
   function applyPendingChange() {
-    onYamlChange(pendingChange.afterYaml, `${pendingChange.sceneTitle} 已应用：${pendingChange.actionLabel}`);
+    onYamlChange(
+      pendingChange.afterYaml,
+      t("sceneEditor.appliedStatus", { action: pendingChange.actionLabel, scene: pendingChange.sceneTitle }),
+    );
     setPendingChange(null);
   }
 
@@ -103,18 +113,18 @@ export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange
   }
 
   return (
-    <section className="scene-editor" aria-label="单场景润色">
+    <section className={`scene-editor ${pendingChange ? "has-pending-change" : ""}`} aria-label={t("sceneEditor.title")}>
       <div className="section-heading">
         <span className="heading-icon">
           <Zap size={18} />
         </span>
-        <h2>单场景润色</h2>
+        <h2>{t("sceneEditor.title")}</h2>
       </div>
 
       <div className="editor-controls">
         {showSceneSelect ? (
           <label>
-            场景
+            {t("sceneEditor.scene")}
             <select
               value={scene.id}
               onChange={(event) => {
@@ -131,7 +141,7 @@ export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange
           </label>
         ) : (
           <div className="current-scene-label">
-            <span>当前场景</span>
+            <span>{t("preview.currentScene")}</span>
             <strong>{scene.title}</strong>
           </div>
         )}
@@ -139,16 +149,16 @@ export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange
         <div className="editor-actions">
           <button disabled={isBusy} type="button" onClick={applyConflictBoost}>
             <Zap size={16} />
-            强化冲突
+            {t("sceneEditor.boostConflict")}
           </button>
           <button
             disabled={isBusy}
-            title={hasDialogue ? "改写当前场景对白" : "当前场景暂无对白，可以先添加对白。"}
+            title={hasDialogue ? t("sceneEditor.rewriteDialogueHint") : t("sceneEditor.addDialogueHint")}
             type="button"
             onClick={applyDialogueRewrite}
           >
             <MessageSquareText size={16} />
-            {hasDialogue ? "修改对白" : "添加对白"}
+            {hasDialogue ? t("sceneEditor.rewriteDialogue") : t("sceneEditor.addDialogue")}
           </button>
         </div>
       </div>
@@ -160,46 +170,66 @@ export default function SceneEditor({ scriptYaml, selectedSceneId, onSceneChange
           onApply={applyPendingChange}
           onDiscard={discardPendingChange}
           sceneId={pendingChange.sceneId}
+          t={t}
         />
       )}
     </section>
   );
 }
 
-function SceneDiff({ actionLabel, afterYaml, beforeYaml, onApply, onDiscard, sceneId }) {
+function SceneDiff({ actionLabel, afterYaml, beforeYaml, onApply, onDiscard, sceneId, t }) {
   const beforeScene = sceneSnapshot(beforeYaml, sceneId);
   const afterScene = sceneSnapshot(afterYaml, sceneId);
+  const beforeLineKeys = new Set(beforeScene.lines.map((line) => line.key));
 
   return (
-    <section className="scene-diff" aria-label="润色前后对比">
+    <section className="scene-diff" aria-label={t("sceneEditor.previewTitle")}>
       <div className="section-heading">
         <span className="heading-icon">
           <MessageSquareText size={18} />
         </span>
-        <h2>润色对比：{actionLabel}</h2>
+        <h2>{t("sceneEditor.previewTitle")}：{actionLabel}</h2>
       </div>
       <div className="diff-grid">
-        <DiffPanel label="修改前" snapshot={beforeScene} />
-        <DiffPanel label="修改后" snapshot={afterScene} />
+        <DiffPanel label={t("sceneEditor.before")} snapshot={beforeScene} t={t} />
+        <DiffPanel highlightChanges label={t("sceneEditor.after")} snapshot={afterScene} beforeLineKeys={beforeLineKeys} t={t} />
       </div>
       <div className="diff-actions">
         <button type="button" onClick={onApply}>
-          应用修改
+          {t("sceneEditor.apply")}
         </button>
         <button type="button" onClick={onDiscard}>
-          放弃修改
+          {t("sceneEditor.discard")}
         </button>
       </div>
     </section>
   );
 }
 
-function DiffPanel({ label, snapshot }) {
+function DiffPanel({ beforeLineKeys = new Set(), highlightChanges = false, label, snapshot, t }) {
   return (
     <article className="diff-panel">
       <h3>{label}</h3>
-      <p>{snapshot.summary}</p>
-      <pre>{snapshot.lines.join("\n")}</pre>
+      <p>{snapshot.summary || t("sceneEditor.noSummary")}</p>
+      <div className="diff-script-lines">
+        {snapshot.lines.length ? (
+          snapshot.lines.map((line) => (
+            <article
+              className={`diff-script-line ${highlightChanges && !beforeLineKeys.has(line.key) ? "added" : ""}`}
+              key={line.key}
+            >
+              <span className="line-type">{t(lineTypeLabel(line.type))}</span>
+              <div className="line-body">
+                {line.speaker && <strong className="speaker">{line.speaker}</strong>}
+                <p>{line.content}</p>
+                {line.note && <p className="line-note">{t("preview.editor.note")}：{line.note}</p>}
+              </div>
+            </article>
+          ))
+        ) : (
+          <p className="empty-state compact">{t("sceneEditor.noScript")}</p>
+        )}
+      </div>
     </article>
   );
 }
@@ -208,13 +238,32 @@ function sceneSnapshot(scriptYaml, sceneId) {
   const scene = scriptYaml.scenes.find((item) => item.id === sceneId);
   const lines = scriptYaml.script
     .filter((line) => line.scene_id === sceneId)
-    .map((line) => {
+    .map((line, index) => {
       const speaker = line.speaker_name || line.speaker_id || line.character_id;
-      return `${line.type}${speaker ? `/${speaker}` : ""}: ${line.text || line.content}`;
+      const content = line.text || line.content || "";
+      return {
+        key: `${line.type}:${speaker || ""}:${content}:${line.note || ""}:${index}`,
+        type: line.type,
+        speaker,
+        content,
+        note: line.note,
+      };
     });
 
   return {
-    summary: scene?.summary || "未填写场景摘要。",
-    lines: lines.length ? lines : ["未生成正文。"],
+    summary: scene?.summary || "",
+    lines,
   };
+}
+
+function lineTypeLabel(type) {
+  const labels = {
+    action: "preview.filter.action",
+    camera: "preview.filter.camera",
+    dialogue: "preview.filter.dialogue",
+    narration: "preview.filter.narration",
+    note: "preview.filter.note",
+    transition: "preview.filter.transition",
+  };
+  return labels[type] || type || "preview.filter.action";
 }

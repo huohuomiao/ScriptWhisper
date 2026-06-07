@@ -35,6 +35,7 @@ export const scriptYaml = {
     genre: "悬疑短剧",
     logline: "旧影院重逢的一夜，让两个人重新面对十年前错过的答案。",
     source: "sample_novel_3chapters.txt",
+    source_language: "zh",
     bible: {
       story_type: "情感悬疑短剧",
       main_conflict: "林澈想继续逃避十年前的选择，沈微逼他重新进入旧影院面对真相。",
