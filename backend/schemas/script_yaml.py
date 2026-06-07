@@ -1,8 +1,8 @@
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-ScriptLineType = Literal["action", "dialogue", "transition", "note"]
+ScriptLineType = Literal["action", "dialogue", "transition", "note", "camera", "narration"]
 
 
 class ProjectInfo(BaseModel):
@@ -13,6 +13,16 @@ class ProjectInfo(BaseModel):
     genre: str | None = None
     logline: str | None = None
     source: str | None = None
+
+    @field_validator("genre", "logline", "source", mode="before")
+    @classmethod
+    def normalize_optional_text(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return str(value)
 
 
 class Character(BaseModel):
@@ -32,6 +42,35 @@ class Location(BaseModel):
     description: str | None = None
 
 
+class SourceRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    chapter_id: str = Field(..., min_length=1)
+    chapter_index: int = Field(..., ge=1)
+    chapter_title: str = Field(..., min_length=1)
+    excerpt: str | None = None
+    paragraph_range: list[int] | None = None
+
+    @field_validator("excerpt", mode="before")
+    @classmethod
+    def normalize_excerpt(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        stripped = str(value).strip()
+        return stripped or None
+
+    @model_validator(mode="after")
+    def validate_paragraph_range(self) -> "SourceRef":
+        if self.paragraph_range is None:
+            return self
+        if len(self.paragraph_range) != 2:
+            raise ValueError("paragraph_range must contain start and end paragraph numbers")
+        start, end = self.paragraph_range
+        if start < 1 or end < start:
+            raise ValueError("paragraph_range must be positive and ordered")
+        return self
+
+
 class Scene(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -40,20 +79,28 @@ class Scene(BaseModel):
     location_id: str = Field(..., min_length=1)
     characters: list[str] = Field(default_factory=list)
     summary: str | None = None
+    source_ref: SourceRef | None = None
 
 
 class ScriptLine(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    id: str | None = Field(default=None, pattern=r"^[A-Za-z][A-Za-z0-9_-]*$")
     scene_id: str = Field(..., min_length=1)
     type: ScriptLineType
     content: str = Field(..., min_length=1)
     character_id: str | None = None
+    speaker_id: str | None = None
+    speaker_name: str | None = None
+    text: str | None = None
+    emotion: str | None = None
+    highlight_color: str | None = None
+    note: str | None = None
 
     @model_validator(mode="after")
     def validate_dialogue_character(self) -> "ScriptLine":
-        if self.type == "dialogue" and not self.character_id:
-            raise ValueError("dialogue script lines require character_id")
+        if self.type == "dialogue" and not (self.character_id or self.speaker_id or self.speaker_name):
+            raise ValueError("dialogue script lines require character_id, speaker_id or speaker_name")
         return self
 
 

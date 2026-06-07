@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 from typing import Any
-from urllib import error, request
+
+import httpx
 
 from backend.schemas.conversion import ConvertRequest, ConvertResponse
 
@@ -59,7 +59,7 @@ class LLMClient:
         if self.mock_mode:
             return mock_response or self._default_mock_response(messages)
 
-        return await asyncio.to_thread(self._chat_sync, messages, temperature)
+        return await self._chat_async(messages, temperature)
 
     async def json(
         self,
@@ -77,37 +77,33 @@ class LLMClient:
         except json.JSONDecodeError as exc:
             raise LLMClientError("LLM response is not valid JSON.") from exc
 
-    def _chat_sync(self, messages: list[dict[str, str]], temperature: float) -> str:
+    async def _chat_async(self, messages: list[dict[str, str]], temperature: float) -> str:
         if not self.settings.api_key or not self.settings.api_base_url or not self.settings.model:
             raise LLMClientError("AI_API_KEY, AI_API_BASE_URL and AI_MODEL are required outside mock mode.")
 
         endpoint = self.settings.api_base_url.rstrip("/") + "/chat/completions"
-        body = json.dumps(
-            {
-                "model": self.settings.model,
-                "messages": messages,
-                "temperature": temperature,
-            },
-            ensure_ascii=False,
-        ).encode("utf-8")
-        req = request.Request(
-            endpoint,
-            data=body,
-            headers={
-                "Authorization": f"Bearer {self.settings.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-
         try:
-            with request.urlopen(req, timeout=60) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise LLMClientError(f"LLM API request failed: {exc.code} {detail}") from exc
-        except (error.URLError, TimeoutError) as exc:
+            async with httpx.AsyncClient(timeout=60) as client:
+                response = await client.post(
+                    endpoint,
+                    headers={
+                        "Authorization": f"Bearer {self.settings.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": self.settings.model,
+                        "messages": messages,
+                        "temperature": temperature,
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.HTTPStatusError as exc:
+            raise LLMClientError(f"LLM API request failed: {exc.response.status_code} {exc.response.text}") from exc
+        except (httpx.RequestError, TimeoutError) as exc:
             raise LLMClientError(f"LLM API request failed: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise LLMClientError("LLM API returned invalid JSON.") from exc
 
         try:
             return payload["choices"][0]["message"]["content"].strip()

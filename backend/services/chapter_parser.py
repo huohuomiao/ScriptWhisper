@@ -61,7 +61,7 @@ def parse_chapters(text: str) -> list[Chapter]:
         next_heading = headings[index] if index < len(headings) else None
         content_start = heading.line_index + 1
         content_end = next_heading.line_index if next_heading else len(lines)
-        end_line = (next_heading.line_number - 1) if next_heading else len(lines)
+        end_line = next_heading.line_number - 1 if next_heading else len(lines)
 
         chapters.append(
             Chapter(

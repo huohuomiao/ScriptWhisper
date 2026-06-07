@@ -16,9 +16,7 @@ class UploadStorageError(RuntimeError):
 
 def _safe_name(filename: str | None) -> str:
     name = Path(filename or "novel.txt").name.strip()
-    if not name:
-        return "novel.txt"
-    return name
+    return name or "novel.txt"
 
 
 def _relative_path(path: Path) -> str:
@@ -43,6 +41,8 @@ async def save_txt_upload(file: UploadFile) -> UploadResponse:
         text = content.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise UploadStorageError("Uploaded file must be UTF-8 text.") from exc
+    if not text.strip():
+        raise UploadStorageError("Uploaded file is empty.")
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     stored_filename = f"{uuid4().hex}_{filename}"

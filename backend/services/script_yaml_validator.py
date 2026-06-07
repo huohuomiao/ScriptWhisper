@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from backend.schemas.script_yaml import ScriptYAML
 
 ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
-LINE_TYPES = {"action", "dialogue", "transition", "note"}
+LINE_TYPES = {"action", "dialogue", "transition", "note", "camera", "narration"}
 
 
 @dataclass(frozen=True)
@@ -24,28 +24,47 @@ def validate_script_yaml(data: ScriptYAML | dict[str, Any]) -> ScriptYAML:
     return data if isinstance(data, ScriptYAML) else ScriptYAML.model_validate(data)
 
 
-def validate_or_repair_script_yaml(data: ScriptYAML | dict[str, Any], *, auto_repair: bool = True) -> ValidationResult:
+def validate_or_repair_script_yaml(
+    data: ScriptYAML | dict[str, Any],
+    *,
+    auto_repair: bool = True,
+    chapters: Any = None,
+) -> ValidationResult:
     try:
-        return ValidationResult(data=validate_script_yaml(data), repaired=False, issues=[])
+        validated = validate_script_yaml(data)
+        if chapters:
+            repaired_data, source_issues = repair_scene_source_refs(validated, chapters)
+            if source_issues:
+                return ValidationResult(
+                    data=ScriptYAML.model_validate(repaired_data),
+                    repaired=True,
+                    issues=source_issues,
+                )
+        return ValidationResult(data=validated, repaired=False, issues=[])
     except ValidationError as exc:
         if not auto_repair:
             raise
-        repaired_data, issues = repair_script_yaml_data(data)
+        repaired_data, issues = repair_script_yaml_data(data, chapters=chapters)
         repaired_model = ScriptYAML.model_validate(repaired_data)
         return ValidationResult(data=repaired_model, repaired=True, issues=issues or _validation_issues(exc))
 
 
-def repair_script_yaml(data: ScriptYAML | dict[str, Any]) -> ScriptYAML:
-    repaired_data, _issues = repair_script_yaml_data(data)
+def repair_script_yaml(data: ScriptYAML | dict[str, Any], *, chapters: Any = None) -> ScriptYAML:
+    repaired_data, _issues = repair_script_yaml_data(data, chapters=chapters)
     return ScriptYAML.model_validate(repaired_data)
 
 
-def repair_script_yaml_data(data: ScriptYAML | dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+def repair_script_yaml_data(
+    data: ScriptYAML | dict[str, Any],
+    *,
+    chapters: Any = None,
+) -> tuple[dict[str, Any], list[str]]:
     raw = data.model_dump(mode="json") if isinstance(data, ScriptYAML) else deepcopy(data)
     if not isinstance(raw, dict):
         raw = {}
 
     issues: list[str] = []
+    chapter_refs = _chapter_refs(chapters)
     repaired: dict[str, Any] = {
         "project": _repair_project(raw.get("project"), issues),
         "characters": [],
@@ -65,6 +84,7 @@ def repair_script_yaml_data(data: ScriptYAML | dict[str, Any]) -> tuple[dict[str
         repaired["locations"],
         character_id_map,
         issues,
+        chapter_refs,
     )
     repaired["script"] = _repair_script_lines(
         raw.get("script"),
@@ -77,6 +97,23 @@ def repair_script_yaml_data(data: ScriptYAML | dict[str, Any]) -> tuple[dict[str
 
     _ensure_scene_script_lines(repaired, issues)
     return repaired, issues
+
+
+def repair_scene_source_refs(data: ScriptYAML | dict[str, Any], chapters: Any) -> tuple[dict[str, Any], list[str]]:
+    raw = data.model_dump(mode="json") if isinstance(data, ScriptYAML) else deepcopy(data)
+    if not isinstance(raw, dict):
+        raw = {}
+
+    chapter_refs = _chapter_refs(chapters)
+    issues: list[str] = []
+    scenes = raw.get("scenes") if isinstance(raw.get("scenes"), list) else []
+    for index, scene in enumerate(scenes, start=1):
+        if not isinstance(scene, dict):
+            continue
+        repaired_source = _repair_source_ref(scene.get("source_ref"), index, chapter_refs, issues)
+        if scene.get("source_ref") != repaired_source:
+            scene["source_ref"] = repaired_source
+    return raw, issues
 
 
 def _repair_project(value: Any, issues: list[str]) -> dict[str, Any]:
@@ -137,6 +174,7 @@ def _repair_scenes(
     locations: list[dict[str, Any]],
     character_id_map: dict[str, str],
     issues: list[str],
+    chapter_refs: list[dict[str, Any]],
 ) -> tuple[dict[str, str], list[dict[str, Any]]]:
     items = value if isinstance(value, list) else []
     if not items:
@@ -148,6 +186,7 @@ def _repair_scenes(
                 "location_id": locations[0]["id"],
                 "characters": list({value for value in character_id_map.values() if value}),
                 "summary": "自动补全的默认场景。",
+                "source_ref": _repair_source_ref(None, 1, chapter_refs, issues),
             }
         ]
 
@@ -177,6 +216,7 @@ def _repair_scenes(
                 "location_id": location_id,
                 "characters": characters,
                 "summary": str(scene.get("summary") or "").strip() or None,
+                "source_ref": _repair_source_ref(scene.get("source_ref"), index, chapter_refs, issues),
             }
         )
 
@@ -210,22 +250,33 @@ def _repair_script_lines(
             scene_id = first_scene_id
 
         line_type = _repair_line_type(line.get("type"))
-        content = str(line.get("content") or "").strip() or "待补全文本。"
+        content = str(line.get("content") or line.get("text") or "").strip() or "待补全文本。"
         entry: dict[str, Any] = {"scene_id": scene_id, "type": line_type, "content": content}
+        for key in ("id", "text", "emotion", "highlight_color", "note", "speaker_name"):
+            if line.get(key):
+                entry[key] = str(line[key])
 
         character_id = character_id_map.get(
             str(line.get("character_id") or "").strip(),
             str(line.get("character_id") or "").strip(),
         )
+        speaker_id = character_id_map.get(
+            str(line.get("speaker_id") or "").strip(),
+            str(line.get("speaker_id") or "").strip(),
+        )
         if line_type == "dialogue":
-            if character_id not in character_ids:
+            if character_id not in character_ids and speaker_id in character_ids:
+                character_id = speaker_id
+            if character_id not in character_ids and not entry.get("speaker_name"):
                 character_id = first_character_id
                 issues.append(f"repaired dialogue character_id at index {index} to '{character_id}'")
-            if character_id not in scene_characters[scene_id]:
+            if character_id in character_ids and character_id not in scene_characters[scene_id]:
                 scene_characters[scene_id].add(character_id)
                 _add_character_to_scene(scenes, scene_id, character_id)
                 issues.append(f"added character '{character_id}' to scene '{scene_id}'")
-            entry["character_id"] = character_id
+            if character_id in character_ids:
+                entry["character_id"] = character_id
+                entry["speaker_id"] = character_id
         elif character_id in character_ids:
             entry["character_id"] = character_id
 
@@ -245,10 +296,161 @@ def _repair_reference_list(value: Any, id_map: dict[str, str], valid_ids: set[st
     return result
 
 
+def _chapter_refs(chapters: Any) -> list[dict[str, Any]]:
+    if chapters is None:
+        return [_default_chapter_ref(1)]
+
+    if isinstance(chapters, dict) and isinstance(chapters.get("chapters"), list):
+        items = chapters["chapters"]
+    elif isinstance(chapters, list):
+        items = chapters
+    else:
+        items = list(chapters) if hasattr(chapters, "__iter__") and not isinstance(chapters, (str, bytes)) else []
+
+    refs: list[dict[str, Any]] = []
+    for fallback_index, item in enumerate(items, start=1):
+        raw = _object_to_dict(item)
+        chapter_index = _positive_int(raw.get("chapter_index") or raw.get("index"), fallback_index)
+        chapter_id = str(raw.get("chapter_id") or raw.get("id") or f"chapter_{chapter_index}").strip()
+        chapter_title = str(raw.get("chapter_title") or raw.get("title") or raw.get("heading") or chapter_id).strip()
+        content = str(raw.get("content") or "").strip()
+        refs.append(
+            {
+                "chapter_id": chapter_id or f"chapter_{chapter_index}",
+                "chapter_index": chapter_index,
+                "chapter_title": chapter_title or f"Chapter {chapter_index}",
+                "excerpt": _chapter_excerpt(content),
+            }
+        )
+
+    if not refs:
+        return [_default_chapter_ref(1)]
+    return sorted(refs, key=lambda ref: ref["chapter_index"])
+
+
+def _repair_source_ref(
+    value: Any,
+    scene_position: int,
+    chapter_refs: list[dict[str, Any]],
+    issues: list[str],
+) -> dict[str, Any]:
+    refs = chapter_refs or [_default_chapter_ref(1)]
+    source = value if isinstance(value, dict) else {}
+    if not source:
+        issues.append(f"added missing source_ref for scene at index {scene_position}")
+
+    by_id = {ref["chapter_id"]: ref for ref in refs}
+    raw_index = _int_or_none(source.get("chapter_index"))
+    requested_id = str(source.get("chapter_id") or "").strip()
+
+    if raw_index is not None:
+        chapter_index = _clamp(raw_index, 1, len(refs))
+        target = refs[chapter_index - 1]
+        if raw_index != chapter_index:
+            issues.append(
+                f"repaired source_ref.chapter_index {raw_index} to {chapter_index} for scene at index {scene_position}"
+            )
+        if requested_id and requested_id in by_id and by_id[requested_id]["chapter_index"] != chapter_index:
+            issues.append(
+                f"repaired mismatched source_ref chapter_id '{requested_id}' to '{target['chapter_id']}'"
+            )
+        elif requested_id and requested_id not in by_id:
+            issues.append(f"repaired unknown source_ref chapter_id '{requested_id}' to '{target['chapter_id']}'")
+    elif requested_id in by_id:
+        target = by_id[requested_id]
+    else:
+        chapter_index = _clamp(scene_position, 1, len(refs))
+        target = refs[chapter_index - 1]
+        if requested_id:
+            issues.append(f"repaired unknown source_ref chapter_id '{requested_id}' to '{target['chapter_id']}'")
+        elif source:
+            issues.append(f"repaired missing source_ref.chapter_id to '{target['chapter_id']}'")
+
+    excerpt = _first_text(source.get("excerpt"), source.get("evidence"), source.get("text"), target.get("excerpt"))
+    repaired = {
+        "chapter_id": target["chapter_id"],
+        "chapter_index": target["chapter_index"],
+        "chapter_title": target["chapter_title"],
+    }
+    if excerpt:
+        repaired["excerpt"] = excerpt
+
+    paragraph_range = source.get("paragraph_range")
+    if _valid_paragraph_range(paragraph_range):
+        repaired["paragraph_range"] = paragraph_range
+    elif paragraph_range is not None:
+        issues.append(f"removed invalid source_ref.paragraph_range for scene at index {scene_position}")
+
+    return repaired
+
+
+def _object_to_dict(value: Any) -> dict[str, Any]:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return value
+    return {
+        "id": getattr(value, "id", None),
+        "chapter_id": getattr(value, "chapter_id", None),
+        "chapter_index": getattr(value, "chapter_index", None),
+        "index": getattr(value, "index", None),
+        "title": getattr(value, "title", None),
+        "heading": getattr(value, "heading", None),
+        "content": getattr(value, "content", None),
+    }
+
+
+def _default_chapter_ref(index: int) -> dict[str, Any]:
+    return {
+        "chapter_id": f"chapter_{index}",
+        "chapter_index": index,
+        "chapter_title": f"Chapter {index}",
+        "excerpt": None,
+    }
+
+
+def _chapter_excerpt(content: str) -> str | None:
+    text = content.replace("\n", " ").strip()
+    return text[:240] or None
+
+
+def _first_text(*values: Any) -> str | None:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _positive_int(value: Any, default: int) -> int:
+    parsed = _int_or_none(value)
+    return parsed if parsed and parsed > 0 else default
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clamp(value: int, lower: int, upper: int) -> int:
+    return min(max(value, lower), upper)
+
+
+def _valid_paragraph_range(value: Any) -> bool:
+    if not isinstance(value, list) or len(value) != 2:
+        return False
+    start, end = value
+    return isinstance(start, int) and isinstance(end, int) and start >= 1 and end >= start
+
+
 def _repair_line_type(value: Any) -> str:
     line_type = str(value or "action").strip().lower()
-    if line_type in {"camera", "shot", "镜头", "镜头提示"}:
-        return "note"
+    if line_type in {"shot", "镜头", "镜头提示"}:
+        return "camera"
     return line_type if line_type in LINE_TYPES else "action"
 
 
