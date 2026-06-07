@@ -172,6 +172,7 @@ AI_MOCK_MODE=false
 - `vite`：开发服务器和构建工具。
 - `@vitejs/plugin-react`：React Vite 插件。
 - `lucide-react`：图标库。
+- `@playwright/test`：UI 验证脚本依赖，用于运行 `tools/verify-ui.mjs` 检查本地页面。
 
 ## 原创功能说明
 
@@ -254,3 +255,8 @@ Demo 视频链接和最终检查记录见 `docs/final_check.md`。
 | PR-19 | 错误处理和集成测试 |
 | PR-20 | README 完善 |
 | PR-21 | Demo 视频与最终检查 |
+| PR-22 | 最终演示集成检查 |
+| PR-23 | 上传文本换行兼容修复 |
+| PR-24 | 同步本地工作区收尾代码、CI 和 UI 验证脚本 |
+
+说明：GitHub PR #3 的健康检查分支因与后续 main 实现重复，按要求跳过未合并；健康检查功能已保留在当前主分支。PR #24 同步前，本地目录 `D:\work\21ai文本转剧本` 仍显示 `.gitignore`、`frontend/src/styles.css`、`package.json`、`package-lock.json` 4 个未提交修改。已将这 4 个文件与当前 `origin/main` 对比，内容无差异，说明它们已经通过 PR #24 合并，不属于仍未上传的遗留改动。
