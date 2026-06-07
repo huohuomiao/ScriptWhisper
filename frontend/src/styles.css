@@ -22,6 +22,10 @@ textarea {
   font: inherit;
 }
 
+button {
+  cursor: pointer;
+}
+
 .app-shell {
   width: min(1240px, calc(100% - 32px));
   margin: 0 auto;
@@ -76,6 +80,7 @@ h1 {
   padding: 0 12px;
   color: #35434a;
   background: #fffaf0;
+  font: inherit;
   white-space: nowrap;
 }
 
@@ -227,6 +232,123 @@ td {
   line-height: 1.55;
 }
 
+.preview-grid {
+  display: grid;
+  gap: 16px;
+}
+
+.scene-card {
+  border: 1px solid #ded4c5;
+  border-radius: 8px;
+  padding: 18px;
+  background: #fffdf8;
+  box-shadow: 0 14px 42px rgb(54 44 30 / 7%);
+}
+
+.scene-header {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+  margin-bottom: 14px;
+}
+
+.scene-number {
+  display: inline-grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border-radius: 8px;
+  color: #ffffff;
+  background: #9b4c32;
+  font-weight: 800;
+}
+
+.scene-header h2 {
+  margin-bottom: 6px;
+  font-size: 1.15rem;
+}
+
+.scene-header p {
+  margin-bottom: 0;
+  color: #56666d;
+  line-height: 1.65;
+}
+
+.scene-meta {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+  gap: 12px;
+  margin: 0 0 16px;
+}
+
+.scene-meta div {
+  border: 1px solid #e5dccf;
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: #ffffff;
+}
+
+.scene-meta dt {
+  margin-bottom: 4px;
+  color: #6b5b44;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.scene-meta dd {
+  margin: 0;
+  color: #28373d;
+}
+
+.script-lines {
+  display: grid;
+  gap: 10px;
+}
+
+.script-line {
+  display: grid;
+  grid-template-columns: 86px minmax(0, 1fr);
+  gap: 12px;
+  border-left: 4px solid #9aa6aa;
+  border-radius: 6px;
+  padding: 12px 12px 12px 14px;
+  background: #ffffff;
+}
+
+.script-line.dialogue {
+  border-left-color: #1d6f7a;
+}
+
+.script-line.note {
+  border-left-color: #6b5b96;
+}
+
+.script-line.transition {
+  border-left-color: #9b4c32;
+}
+
+.line-type {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #5e6b70;
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.line-body strong {
+  display: block;
+  margin-bottom: 4px;
+  color: #1d6f7a;
+}
+
+.line-body p {
+  margin-bottom: 0;
+  color: #27363c;
+  line-height: 1.7;
+}
+
 @media (max-width: 840px) {
   .app-shell {
     width: min(100% - 20px, 760px);
@@ -250,5 +372,10 @@ td {
   .row-meta {
     align-items: flex-start;
     grid-column: 2;
+  }
+
+  .scene-meta,
+  .script-line {
+    grid-template-columns: 1fr;
   }
 }
