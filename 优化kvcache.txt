@@ -1,0 +1,181 @@
+KV cache 量化的具体每一步（真机演示）
+
+  刚才那个脚本 demo_kvcache_quant_steps.py 在真机上跑了 8 个步骤，我把它讲成一个完整的学习路径：
+
+  ---
+
+  第 0 步：先理解 KV cache 是什么、为什么能量化
+
+  KV cache 存的是每一层、每个 token 的 Key 和 Value 向量。以 Qwen3-8B 为例：
+
+  每个 token 每层: 2(K+V) × 8 KV heads × 128 dim = 2048 个数
+  bf16: 每个 token 每层 4 KB
+  4096 上下文 × 36 层 = 576 MB (单请求!)
+
+  能量化的原因：K/V 是 attention 内部的中间结果，不是最终输出。量化误差会被 softmax 归一化"平滑掉"，对最终 logits 影响很小。bf16(2字节)→int8(1字节)，直接省一半显存。
+
+  ---
+
+  第 1 步：分配 KV cache —— bf16 vs int8 的显存对比
+
+  bf16 KV cache: (64, 8, 16, 128) = 4096.0 KB
+  int8 KV cache: (64, 8, 16, 128) = 2048.0 KB
+  节省: 50%
+
+  关键点：MLU 的 cache layout 是 (num_blocks, num_kv_heads, block_size, head_dim)，head 维度在 block_size 之前（与 CUDA 不同）。这个 layout 定义在 platform.py:25 的
+  kv_cache_shape。我一开始写错了顺序，真机报错 k_cache must have shape (num_blocks, num_heads, block_size, head_dim)
+  才发现——这就是真机验证的价值，文档/记忆可能记错，跑一下才知道。
+
+  ---
+
+  第 2 步：per-token 量化的数学（量化的核心）
+
+  scale = max(|x|) / 127           # 找这个 token 里的最大绝对值
+  x_int8 = round(x / scale)         # 缩放到 int8 范围 [-127, 127]
+  反量化: x ≈ x_int8 * scale
+
+  "per-token" 的含义：同一个 token 的每个 head 独立算一个 scale。
+  - K 的 shape: [num_tokens, num_kv_heads, head_dim] = [1, 8, 128]
+  - 在 head_dim 维度上取 max → 每个 token 每个 head 一个 scale
+  - scale shape: [num_tokens, num_kv_heads, 1]
+
+  实际推理时，quant_to_paged_cache 自动算 scale，不需要手动算。
+
+  ---
+
+  第 3 步：写入 KV cache —— 两个算子的对比
+
+  这是 KV cache 量化和不量化的核心区别：
+
+第 3 步：写入 KV cache —— 两个算子的对比
+
+  这是 KV cache 量化和不量化的核心区别：
+
+  ┌─────────────┬─────────────────────────┬───────────────────────────────┐
+  │             │ 当前 nanovllm（不量化） │            量化后             │
+  ├─────────────┼─────────────────────────┼───────────────────────────────┤
+  │ 算子        │ reshape_paged_cache     │ quant_to_paged_cache          │
+  ├─────────────┼─────────────────────────┼───────────────────────────────┤
+  │ cache dtype │ bf16                    │ int8                          │
+  ├─────────────┼─────────────────────────┼───────────────────────────────┤
+  │ 额外参数    │ 无                      │ k_scale, v_scale              │
+  ├─────────────┼─────────────────────────┼───────────────────────────────┤
+  │ 一次完成    │ 拷贝                    │ 量化 + 写入 + 存 scale 三件事 │
+  └─────────────┴─────────────────────────┴───────────────────────────────┘
+
+  真机结果：
+  方式 A (bf16): reshape_paged_cache(...) ✓
+  方式 B (int8): quant_to_paged_cache(k, v, k_cache_int8, v_cache_int8, k_scale, v_scale, slot_mapping) ✓
+    k_cache_int8 写入后: dtype=torch.int8, 非零元素数=128
+    k_scale 写入后: dtype=torch.float32, 值示例=0.0273
+
+  注意 scale 的 shape：(num_blocks, num_kv_heads, block_size)，是 3 维（每个 token 一个 scale 值），不是 4 维。这个我也是真机报错 k_cache_scale must have shape
+  (num_blocks, num_heads, block_size) 才确认的。
+
+  ---
+
+  第 4 步：读取量化 cache —— decode attention 的 scale 参数
+
+  读取时，single_query_cached_kv_attn 需要知道 cache 是量化的，靠两个东西：
+  1. 传 k_scale, v_scale：用于反量化（int8 × scale → 近似 bf16）
+  2. 传 kv_cache_quant_bit_size=8：告诉算子 cache 是 int8
+
+  对比当前 attention_mlu.py:105 的 decode_attention：
+# 当前 (不量化):
+  ops.single_query_cached_kv_attn(query, k_cache, v_cache, output,
+      block_tables, context_lens,
+      None,   # <- K-cache scale (传 None = 不量化)
+      None,   # <- V-cache scale (传 None = 不量化)
+      None, max_seqlen_k, -1, -1, scale, False,
+      head_size_v=-1, compute_dtype=torch.float32)
+
+  # 量化后: 只需把两个 None 换成 scale, 加一个 quant_bit_size
+  ops.single_query_cached_kv_attn(query, k_cache_int8, v_cache_int8, output,
+      block_tables, context_lens,
+      k_scale, v_scale,          # <- 改这里
+      None, max_seqlen_k, -1, -1, scale, False,
+      head_size_v=-1, compute_dtype=torch.float32,
+      kv_cache_quant_bit_size=8)  # <- 加这个
+
+  真机两种都跑通了。
+
+  ---
+
+  第 5 步：精度验证 —— int8 量化引入多少误差
+
+  用 64 个 token 填充 cache，对比 bf16 vs int8 的 attention 输出：
+
+  bf16 输出均值 |x|: 0.15820
+  int8 输出均值 |x|: 0.15820
+  平均绝对误差: 0.001427
+  最大绝对误差: 0.007812
+  相对误差: 0.902%   <- 对 LLM 推理来说很小
+
+  0.9% 的相对误差，完全可用。这和之前测的 0.65% 是同一量级（不同随机种子略有差异）。
+
+  ---
+
+  第 6 步：真实 Qwen3-8B 的显存收益
+
+  ctx=  512: bf16=   72.0MB -> int8=   36.0MB  (省   36.0MB, 50%)
+  ctx= 2048: bf16=  288.0MB -> int8=  144.0MB  (省  144.0MB, 50%)
+  ctx= 4096: bf16=  576.0MB -> int8=  288.0MB  (省  288.0MB, 50%)
+  ctx= 8192: bf16= 1152.0MB -> int8=  576.0MB  (省  576.0MB, 50%)
+
+  上下文越长，省的越多。ctx=8192 单请求就省 576MB。
+
+  ---
+
+  第 7 步：为什么 KV cache 量化对 TPOT 影响小（最关键的理解）
+
+  这是初学者最容易搞混的点。回到 profiler 的数据：
+
+  Graph, batch=1, decode 单步 13.9ms:
+    GEMM (权重读取)      7.98ms  57%  ← 权重量化作用这里
+    RMSNorm              2.87ms  21%
+    Attention (读KV)     0.56ms   4%  ← KV量化作用这里
+    RoPE + KV store      0.69ms   5%
+
+  权重量化和 KV 量化作用在完全不同的地方：
+┌───────────────┬────────────────────┬──────┬──────────────────────┐
+  │               │      作用对象      │ 占比 │       量化价值       │
+  ├───────────────┼────────────────────┼──────┼──────────────────────┤
+  │ 权重量化      │ GEMM（读权重）     │ 57%  │ 降 TPOT（降延迟）    │
+  ├───────────────┼────────────────────┼──────┼──────────────────────┤
+  │ KV cache 量化 │ Attention（读 KV） │ 4%   │ 省 KV 显存（升吞吐） │
+  └───────────────┴────────────────────┴──────┴──────────────────────┘
+
+  - 权重量化作用于占 57% 的 GEMM → 即使只省 20% 也降 ~2ms TPOT（明显）
+  - KV 量化作用于占 4% 的 attention → 省一半也只省 0.28ms（几乎看不出）
+
+  所以 KV cache 量化的真正价值不是降延迟，而是省显存——能开更大 batch / 更长上下文。两者作用在不同地方，不矛盾，可以叠加。
+
+  KV 量化真正发挥作用的场景：
+  - 长上下文（ctx=32K/128K）：KV cache 占显存大头，量化后能多塞几倍请求
+  - 高并发（batch=64+）：多请求 KV 累加，量化省的显存能换更多并发
+  - batch=1 短上下文：KV 量化对 TPOT 几乎无感（就像本例）
+
+  ---
+
+  第 8 步：接入 nanovllm 需要改的 3 个地方
+
+  要真正启用 int8 KV cache，需要改 3 处（都在已有代码里，不需要新写算子）：
+
+  【1】attention_mlu.py store_kvcache（第 29 行） — 写入端
+  # 当前: ops.reshape_paged_cache(key, value, k_cache, v_cache, slot_mapping)
+  # 改为: ops.quant_to_paged_cache(key, value, k_cache, v_cache,
+  #                                 k_scale, v_scale, slot_mapping)
+
+  【2】attention_mlu.py decode_attention（第 105 行） — 读取端
+  # 当前: ops.single_query_cached_kv_attn(..., None, None, ..., compute_dtype=...)
+  # 改为: ops.single_query_cached_kv_attn(..., k_scale, v_scale, ...,
+  #                                 kv_cache_quant_bit_size=8, compute_dtype=...)
+
+  【3】model_runner.py allocate_kv_cache（第 115 行） — 分配端
+  # 当前: kv_cache = torch.zeros(..., dtype=torch.bfloat16)
+  # 改为: kv_cache = torch.zeros(..., dtype=torch.int8)
+  #       k_scale = torch.zeros(..., dtype=torch.float32)  # 额外分配
+  #       v_scale = torch.zeros(..., dtype=torch.float32)
+
+  三处改完就能跑通。核心难点不在算法，在于把 scale tensor 正确地在 model_runner → attention layer 之间传递（graph capture 时要固定）。
+
