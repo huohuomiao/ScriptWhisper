@@ -1,0 +1,182 @@
+# layout_v2_report.md — Block-Major CPU KV Pool V2 验证
+
+- **日期**: 2026-08-21 · **硬件**: MLU590-M9DG (80GB) · torch_mlu 1.31.1
+- **模型**: Qwen3-8B (TP=1) · KV dtype bfloat16
+- **MLU KV layout**: `(2, 36, N, 8, 16, 128)` · 单 logical KV block = 2.25MB
+- **阶段范围**: 仅 CPU Pool V1 vs V2 布局实验 + 同步 Store/Load + 正确性 + Prefill 对比。
+  未接 Scheduler / Prefix Hash / LRU / Async / 真实 HIT。
+
+---
+
+## 1. V1 Host 瓶颈回顾 (为什么做 V2)
+
+V1 用与 MLU 相同的 layout `(2,L,B,H,T,D)`, **block 维 (index 2) 夹在 layer 维 (index 1) 内**。
+所以 `cpu_pool.kv[:, :, block_id, :, :, :]` 是 strided view (`is_contiguous()==False`), 跨 36 层拆开。
+host 端访问这种 block-dim-in-middle 池,读或写约 **0.7~1.2 GB/s** —— 这才是真正瓶颈,不是 DMA。
+
+| 方向 | 实测带宽 |
+|---|---|
+| strided MLU → contig CPU (D2H) | ~31 GB/s (快) |
+| contig CPU → contig MLU (H2D) | ~22 GB/s (快) |
+| host: contig → strided 池 (写) | 0.7–0.9 GB/s (慢) |
+| host: strided 池 → contig (读) | 0.7–1.2 GB/s (慢) |
+
+本环境 V1 复现 (256 blocks, 576MB): **Store ≈ 307.8ms, Load ≈ 398.7ms** (与上一阶段 311/335ms 同量级)。
+
+V2: 把 block 维提到最外层,layout conversion 全部移到 MLU 侧,host 端零 copy,让 Store/Load 重新由 DMA 主导。
+
+## 2. V2 Block-Major CPU Layout
+
+```
+V1: (2, 36, B, 8, 16, 128)    block 在 layer 内 → strided
+V2: (B, 2, 36, 8, 16, 128)    block 最外层   → 每 block 连续
+```
+
+`CPUKVPoolV2.kv` = `(num_blocks, 2, 36, 8, 16, 128)`, bf16, **pin_memory=True**, 一次性预分配。
+
+## 3. CPU Block 连续性验证
+
+```
+self.kv.is_pinned()          == True
+self.kv.is_contiguous()      == True
+self.kv[0].is_contiguous()   == True
+self.kv[0].shape             == (2, 36, 8, 16, 128)
+self.kv[0].stride            == (589824, 16384, 2048, 128, 1)    # 连续
+self.kv[0:8].is_contiguous() == True    # 整段连续, H2D/D2H 整段直达
+单 block 字节                == 2.25MB  (连续 logical block)
+目标达成:`cpu_pool.kv[block_id]` 是一整块真正连续的 2.25MB;连续 cpu 段整体连续,可一次 H2D/D2H。
+
+## 4. MLU Pack 实现 (store 侧)
+
+预分配单块连续 V2 MLU staging `(max_blocks, 2, 36, 8, 16, 128)`,全程复用不在测量内 malloc。三种 device 侧 pack (native `{n,BLK}` 子集 → 连续 `(n,2,36,8,16,128)`):
+
+- `slice`   (src 连续): `mlu_kv[:,:,s:e,:,:,:]` strided slice → `permute(2,0,1,3,4,5)` → copy 进 staging (无 gather)。
+- `A`       advanced-index: `mlu_kv[:,:,idx,:,:,:]` → permute → materialize。
+- `B`       index_select(dim=2) → permute → materialize。
+
+全部 **MLU/device 侧**。`pack*_device` 计入所有 index/gather/permute/materialize/staging copy($9)。连续 mlu_ids 走 `slice`。
+
+## 5. Store 路径
+
+```
+MLU native {mlu_ids}
+ → [device pack] 连续 V2 MLU staging (n,2,36,8,16,128)
+ → [一次 D2H non_blocking] → blocks_slice(start,end) 连续 CPU Block-Major 池
+```
+host 端 **zero 二次整理**,D2H 直接落最终 CPU 池。
+
+## 6. Load 路径
+
+```
+CPU Block-Major 连续块 [start:end]
+ → [一次 H2D non_blocking] → 连续 V2 MLU staging
+ → [device unpack/scatter] permute(1,2,0,3,4,5) → 写回 MLU native {mlu_ids}
+```
+CPU 对连续块零额外读格式化。
+
+## 7. MLU Unpack/Scatter
+
+`tmp = staging.permute(1,2,0,3,4,5)`(view)写回 MLU:
+- `adv_assign`(默认):`mlu_kv[:,:,ids,:,:,:] = tmp`
+- `index_copy_`:`mlu_kv.index_copy_(2, ids, tmp)`(非 contiguous 需 `.contiguous()`,计入 device 时间)
+- `slice` / `contig_run`:连续目标按段直接 copy
+
+全部 device 侧;4 种均通过 correctness。
+## 8. Correctness
+
+**190 passed / 0 failed** (`test_layout_v2.py`)。
+- CPU 池连续性断言 (6 项)。
+- **arbitrary physical remapping** `[7,21,35,80]→cpu[0,1,2,3]→[101,18,66,53]` 逐 mapping `torch.equal==True`。
+- 4 种映射类型 A/B/C/D × 规模 1/4/16/64/128/256,全部 bit-exact。
+- 4 种 unpack(incl. random src)× 规模; 3 种 pack(slice/A/B)× 规模,全部 bit-exact。
+- 确认修改的是**原始 `mlu_native` tensor**(从原始索引直接读回,非 advanced-index 临时 tensor)。
+
+## 9. V1 vs V2 Store
+
+| blocks | tokens | MB | V1_ms | V1_GB/s | V2_ms | V2_GB/s | 加速 |
+|---|---|---|---|---|---|---|---|
+| 16 | 256 | 36.0 | 4.00 | 8.78 | 1.58 | 22.21 | 2.5× |
+| 64 | 1024 | 144 | 67.13 | 2.09 | **5.10** | **27.6** | 13.2× |
+| 128 | 2048 | 288 | 121.04 | 2.33 | **9.83** | **28.60** | 12.3× |
+| **256** | **4096** | **576** | **307.81** | 1.83 | **19.29** | **29.17** | **16.0×** |
+
+**V2 Store at 256 = 19.3ms, 29.2 GB/s** ≈ D2H 基线 (~31),`slice` pack 可选 ~31.6 GB/s。达标 (>15 最低 / >20 较好)。
+
+## 10. V1 vs V2 Load
+
+| 物理 | tokens | block | V1_ms | V1_GB/s | V2_ms | V2_GB/s | 加速 |
+|---|---|---|---|---|---|---|---|
+| 16 | 256 | 36.0 | 8.63 | 4.07 | 12.07 | 2.91 | — |
+| 64 | 1024 | 144 | 29.93 | 4.70 | **16.29** | **8.63** | 1.8× |
+| 128 | 2048 | 288 | 196.16 | 1.43 | **21.95** | **12.82** | 8.9× |
+| **256** | **4096** | **576** | **398.68** | 1.41 | **33.24** | **16.92** | **12.0×** |
+
+**V2 Load at 256 = 33.2ms, 16.9 GB/s, 12.0× 加速**。低于 H2D 基线 (22) 因含 unpack scatter(见 §11)。
+
+## 11. pack / DMA / unpack 时间拆分 (V2)
+
+| blocks | store_wall | pack_dev | D2H_dev | load_wall | H2D_dev | unpack_dev |
+|---|---|---|---|---|---|---|
+| 64 | 5.10 | 0.76 | 4.27 | 10.86 | 5.01 | 5.75 |
+| 128 | 9.83 | 1.23 | 8.53 | 16.41 | 10.09 | 6.25 |
+| **256** | **19.37** | **2.16** | **17.05** | **27.28** | **19.96** | **7.24** |
+
+- **Store 256**: 19.4ms ≈ D2H 17.1ms (pack 仅 2.2ms)。
+- **Load 256**: 27.3ms ≈ H2D 20.0ms (unpack 7.2ms)。
+- **device-event 与 wall-clock 几乎一致** (§16 #9);wall 以 perf_counter 计时为准。
+→ **总耗时重新由 DMA 主导, 不再由 host reformat 主导** —— §目标确认。
+
+## 12. 真实 Prefill vs V2 Load
+
+用当前 nano Qwen3-8B(eager+rmsnorm 优化)测真实 prefill(第一次 `step()`= 全 prompt);V2 Load 用 `ceil(pl/16)` 块连续 load(4 次 median) 。
+
+| Prefix | KV_MB | Prefill_ms | V2_Load_ms | Load/Prefill | gate(Load<Prefill) |
+|---|---|---|---|---|---|
+| 512 | 72 | 59.54 | **12.98** | **0.218** | ✓ |
+| 1024 | 144 | 68.22 | **15.35** | **0.225** | ✓ |
+| 2048 | 288 | 80.93 | **20.18** | **0.249** | ✓ |
+| **4096** | **576** | **109.57** | **29.81** | **0.272** | ✓ |
+
+**V2 Load 在 4/4 个 prefix 都明显快于重新 Prefill** (只需其 ~22%~27%)。满足 §十五.
+(gate: `T_V2_Load ≪ T_Prefill`) → **允许进入 Prefix Hash**.
+
+## 13. 当前瓶颈
+
+- Store 256: 29.2~31.6 GB/s ≈ D2H 上限,**无瓶颈**。
+- Load 256: 16.9 GB/s;剩余开销是 **unpack device scatter ~7ms**,非 host。
+- 小 block (≤16) 由 launch/同步固定开销主导,prefix 大块连续场景不受累。
+- 内存: host reformat 已彻底消除,总量由 DMA(和一次性 staging ~720MB)决定。
+
+## 14. 是否进入 Prefix Hash —— **结论 A: PASS**
+
+- Correctness 190/190;arbitrary physical remapping PASS;host strided copy 消除。
+- 256 Store ∥16× Load 12× 优于 V1;4/4 prefix 下 V2 Load < Prefill。
+- 满足 §22 全部停止条件 → **建议进入下一阶段: Prefix Hash + CPU block mapping**。本阶段到此停止。
+
+---
+
+## §16 逐项检查
+
+1. block 真连续? **是**(→3)。2. D2H 直接落最终池无二次整理? **是**。3. H2D 直读最终池不改写? **是**。4. pack 在 MLU? **是** (§4. 5. unpack 在 MLU? **是** (§7)。6. 隐式 CPU materialize? **无**。7. 循环内重复 allocation? **无**(staging 一次性)。8. advanced-index 临时带 hidden? **列 pack_all**。9. wall 与 device 差大? **几乎一致**。
+
+## §十七 §内存占用
+- CPU V1 Pool (2,36,512,…): **1152 MB**
+- CPU V2 Pool (512,2,36,…): **1152 MB** (同规模,无膨胀)
+- MLU V2 staging (320 块): **720 MB**
+- MLU KV cache (1024 块): **2304 MB**
+
+V2 较 V1 无内存膨胀。
+## 交付文件
+```
+kv_offload_poc/layout_v2/
+├── cpu_kv_pool_v2.py
+├── kv_block_mover_v2.py
+├── test_layout_v2.py
+├── benchmark_layout_v2.py
+├── benchmark_prefill_v2.py
+└── results/
+    ├── layout_v1_vs_v2.csv
+    ├── layout_v2_breakdown.csv
+    ├── layout_v2_prefill_compare.csv
+    └── layout_v2_report.md
+```
