@@ -1,0 +1,306 @@
+# Prefix KV Offload 第五步 —— BlockManager / Scheduler 同步接入 + 第一次真实 CPU Prefix HIT
+
+> 报告: `sync_scheduler_prefix_hit_report.md`
+> 数据: `sync_scheduler_prefix_hit.csv`
+> 测试: `test_cpu_prefix_scheduler.py` (31 passed / 0 failed)
+> 基准: `benchmark_cpu_prefix_hit.py`
+
+---
+
+## §1 概述与目标
+
+本步将前序 PoC 阶段（CPU Prefix Index / CPUKVPoolV2 / KVBlockMoverV2）的 CPU Prefix Cache（L2）**同步接入** nanoLLM 真实请求执行链路，实现第一次真实 CPU Prefix HIT 闭环：
+
+```
+Request A: 正常 Prefill → 完成时 Store prefix KV 到 CPU
+Request B: L1 MLU MISS → L2 CPU HIT → 分配新 MLU physical blocks → CPU KV Load 到 MLU
+          → 跳过已命中 prefix → 只 prefill suffix → 正常 decode
+```
+
+严格遵循阶段约束：**仅同步 CPU Prefix Cache 接入**，不实现 Async Store/Load、LRU/ARC、refcount/pending、background worker、Attention Kernel 改动、KV layout 改动、CNRT C++ 扩展、Active KV Offload、SSD/三级 Cache、大范围架构重构。
+
+查询顺序严格为 **L1 MLU → L2 CPU → Prefill**（CPU 不覆盖已有 MLU 命中）。Store 在 Request 完成、deallocate **之前**执行（源 KV 仍有效）。Load 失败安全 rollback 回原始 Prefill。输出正确性：Cold Prefill 与 CPU HIT 路径 greedy decoding 严格 exact match。
+
+---
+
+## §2 实现范围与约束遵守
+
+| 约束项 | 状态 | 说明 |
+|---|---|---|
+| 同步 CPU Prefix Cache 接入 | ✅ 已实现 | 全程同步, 无 async/worker |
+| Async Store/Load | ❌ 未实现 | 严格遵守 |
+| LRU / ARC | ❌ 未实现 | 仅 hash 去重 + 整批容量检查 |
+| refcount / pending | ❌ 未实现 | 复用 BlockManager 现有 ref_count |
+| background worker | ❌ 未实现 | 无后台线程 |
+| 修改 Attention Kernel | ❌ 未实现 | attention 走原 block_table 路径 |
+| 修改 KV layout | ❌ 未实现 | MLU layout 不变; CPU pool 用 V2 Block-Major |
+| CNRT C++ 扩展 | ❌ 未实现 | 纯 Python + torch_mlu |
+| Active KV Offload | ❌ 未实现 | 仅 prefix cache, 不做 active evict |
+| SSD / 三级 Cache | ❌ 未实现 | 仅 L1 MLU + L2 CPU |
+| 大范围架构重构 | ❌ 未实现 | 仅 BlockManager +5 方法, Scheduler 接入, Engine 装配 |
+| 为性能改无关代码 | ❌ 未实现 | 改动集中在 CPU offload 路径 |
+修改文件清单（最小侵入）：
+
+| 文件 | 改动 | 行数 |
+|---|---|---|
+| `nanovllm/config.py` | +3 配置字段 | ~3 |
+| `nanovllm/engine/block_manager.py` | +5 方法 (compute_chain_hashes/allocate_prefix/commit_cpu_hit/rollback_cpu_hit/collect_store_blocks) | ~100 |
+| `nanovllm/engine/scheduler.py` | +cpu_prefix 接入 / reset_l1_cache / _cpu_lookup_and_load / _store_to_cpu / postprocess Store | ~120 |
+| `nanovllm/engine/llm_engine.py` | +backend 装配 + attach | ~15 |
+| `kv_offload_poc/prefix_index/prefix_cache_backend.py` | 默认 unpack/pack method 调整 | ~2 |
+| `kv_offload_integration/*` | 测试 + 基准 (新增) | — |
+
+**未改动**：model_runner.py（kv_cache 即 backend.mover.mlu_kv，同一张量引用）、attention、sequence（仅用现有字段）、KV layout。
+
+---
+
+## §3 架构与接入点
+
+```
+LLMEngine
+  ├── ModelRunner (持有 kv_cache 张量)
+  ├── Scheduler
+  │     ├── BlockManager (L1: hash_to_block_id, blocks, free/used)
+  │     └── cpu_prefix: PrefixCacheBackend | None   ← L2, 由 Engine 注入
+  │           ├── CPUPrefixIndex   (block_hash → cpu_block_id)
+  │           ├── CPUKVPoolV2      (Block-Major CPU pool)
+  │           └── KVBlockMoverV2   (MLU↔CPU 搬运, mlu_kv = ModelRunner.kv_cache)
+  └── cpu_prefix_backend (生命周期覆盖多 Request)
+```
+
+关键约束：`BlockManager` 只管 block id 元数据，**不持有 kv_cache 张量**；Load 需写 kv_cache，故 CPU backend 由 LLMEngine 持有（含 mover，mover.mlu_kv 即 ModelRunner.kv_cache 同一引用），注入 Scheduler。装配顺序：先 ModelRunner（有 kv_cache）→ 再 Scheduler → 再建 backend 注入。
+
+---
+
+## §4 BlockManager 扩展（5 个方法）
+
+1. **`compute_chain_hashes(seq, num_blocks)`**：算前 `num_blocks` 个完整 block 的链式 xxh64 hash（复用 `compute_hash`），不修改状态。供 Scheduler 做 L2 lookup。
+2. **`allocate_prefix(seq, l1_hit, l2_hit)`**：一次性分配新 seq 全部 block。
+   - L1 命中块（前 `l1_hit`）：原 `allocate` 命中逻辑（ref_count++ / 取 free），写 block_table。
+   - L2 命中块（接下来 `l2_hit`）：`_allocate_block` 占位（ref_count=1, hash=-1），写 block_table，返回 `(block_ids, hashes, token_blocks)` 供外层 Load+commit。
+   - suffix 块（剩余）：`_allocate_block`。
+   - 设 `seq.num_cached_tokens = (l1_hit + l2_hit) * block_size`。
+3. **`commit_cpu_hit(l2_block_ids, l2_hashes, l2_token_blocks)`**：Load 同步成功后调用，`block.update(h, token_ids)` + `hash_to_block_id[h] = block_id`（promote L2→L1）。
+4. **`rollback_cpu_hit(l2_block_ids)`**：Load 失败时，`ref_count=0` + `_deallocate_block` 归还占位块。
+5. **`collect_store_blocks(seq)`**：收集所有**完整** block（不含 partial 末块）的 `(hash, mlu_block_id)`，供 Store。
+
+---
+
+## §5 Scheduler 接入
+
+### 5.1 `schedule()` prefill 分支
+```
+seq 无 block_table:
+  num_cached_blocks = block_manager.can_allocate(seq)      # L1 MLU lookup
+  if cpu_prefix is not None and num_cached_blocks != -1:
+      ok, l2_hit, _, _ = _cpu_lookup_and_load(seq, num_cached_blocks)  # L2
+      if ok: num_cached_blocks += l2_hit                    # 扩展为 L1+L2
+  num_tokens = seq.num_tokens - num_cached_blocks * block_size
+  block_manager.allocate(seq, num_cached_blocks)            # L2 成功时 block_table 已就绪
+```
+
+L2 失败时 `seq.block_table` 已清空，`num_cached_blocks` 保持原 L1 值，走下方原 `allocate(seq, l1_hit)` 路径（全量或 L1 命中 prefill）。
+
+### 5.2 `_cpu_lookup_and_load(seq, l1_hit)`（严格 §十一 顺序）
+1. CPU metadata lookup（从 `l1_hit` 起，不重查 L1 命中块）
+2. 分配目标 MLU physical blocks（`allocate_prefix`，含 L1/L2/suffix）—— **alloc 失败也 rollback**
+3. `KVBlockMoverV2.load()`（CPU KV → 新 MLU blocks）
+4. `torch.mlu.synchronize()`（跨流可见性：Load 写 transfer_stream，prefill 读默认流）
+5. `commit_cpu_hit`（promote L2→L1）
+6. block_table / num_cached_tokens 已在 `allocate_prefix` 设好
+
+**L2 命中上限 = `num_blocks - 1`**（与 `can_allocate` 的 `range(num_blocks-1)` 一致）：始终保留最后一个 block 给 prefill 产生首 token，避免 L1+L2 覆盖全部 full block 导致 0-token prefill 崩溃。
+
+### 5.3 失败 rollback（§十二）
+- **alloc 失败**：`deallocate(seq)` 回退 partial 分配的 ref_count/释放块，清 `num_cached_tokens`，`last_cpu_hit={ok:False, reason:"alloc_exception"}`，返回 False → 走原始 Prefill。
+- **load 异常**：`rollback_cpu_hit(l2_block_ids)` 释放占位块，清 block_table，`num_cached_tokens=0`，`last_cpu_hit={ok:False, reason:"load_exception"}`，返回 False → 走原始 Prefill。
+
+### 5.4 `postprocess` Store（§五/六）
+FINISHED 时：`_store_to_cpu(seq)` → `block_manager.deallocate(seq)`。Store 在 deallocate **之前**，保证源 MLU block KV 仍有效。`_store_to_cpu` 调 `collect_store_blocks` 取完整块 → `backend.store_blocks`（hash 去重，整批容量检查）。
+
+---
+
+## §6 LLMEngine 装配
+
+`config.cpu_prefix_offload=True` 时，在 ModelRunner + Scheduler 创建后，用 `model_runner.kv_cache` 构造 `PrefixCacheBackend`（unpack=`contig_run`, pack=`B`, 避开 int32 advanced-index 限制），`scheduler.attach_cpu_prefix(backend)`。backend 生命周期覆盖多 Request，复用同一 CPU pool/index/mover。
+
+---
+
+## §7 Config
+
+```python
+cpu_prefix_offload: bool = False   # L2 CPU Prefix Cache 开关
+cpu_prefix_blocks: int = 512       # CPU pool block 数
+cpu_prefix_debug: int = 0           # 调试日志级别
+```
+
+---
+
+## §8 Store 路径细节
+
+- 时机：Request FINISHED、deallocate 之前（§六，源 KV 有效）。
+- 范围：仅完整 block（`collect_store_blocks` 排除 partial 末块，§七）。
+- 去重：`store_blocks` 逐 hash 查 index，已命中跳过（不重复占 CPU block，§八）。
+- 容量：`cpu_pool.allocate` 整批原子（不足即整批 fail，无 partial，无 free-list 泄漏，§二十六）。
+- 顺序：先 mover.store（D2H）成功，后 commit hash-insert（避免半成品索引）。
+
+---
+
+## §9 Load + Commit + Rollback 细节
+
+- **Load**：`backend.load_prefix(hashes[:l2_hit], l2_block_ids)` 按 CPU 连续 run 分段 H2D + device unpack（`contig_run`，slice-based，host 端无 strided 访问，规避 host 带宽瓶颈）。
+- **跨流同步**：`torch.mlu.synchronize()` 必须在 Load 后、prefill 前，保证 transfer_stream 的写对默认流可见。
+- **Commit**：`commit_cpu_hit` 在 Load 同步成功后，`block.update` + `hash_to_block_id` 注册。此后该 prefix 在 L1 也可命中（后续同 prefix 请求走 L1，CPU 不承担主路径）。
+- **Rollback**：alloc 失败 / load 异常两条路径均安全回退，请求不崩，fallback 全量 prefill。
+
+---
+
+## §10 测试构造：真正的 L1 MISS + L2 HIT（§十五/十六）
+
+**不破坏状态强制 L1 MISS**，而是 `scheduler.reset_l1_cache()`：重建空 BlockManager（`hash_to_block_id` 空 + free_list 全满），**保留同一 cpu_prefix backend**（CPU index/pool/mover 不变）。所有 running/waiting seq 已结束（调用前 drain）。
+
+```
+Request A (Cold): be.clear() + reset_l1_cache() → 全量 prefill → 完成 Store prefix 到 CPU
+Request B (CPU HIT): reset_l1_cache() (L1 空, CPU 保留 A 的 prefix)
+                    → 同 prefix + 不同 suffix → L1 MISS + L2 HIT → Load + 只 prefill suffix
+```
+
+---
+
+## §11 集成测试结果（test_cpu_prefix_scheduler.py）
+
+
+**31 passed / 0 failed**
+
+| 用例 | 结果 | 关键验证 |
+|---|---|---|
+| Case A: Cold Miss | PASS | last_cpu_hit=None, first_sched=4128 (全量) |
+| Case B: MLU L1 HIT | PASS | last_cpu_hit=None (L1 覆盖, CPU 不承担), first_sched=32 |
+| Case C: CPU L2 HIT (核心) | PASS | l1_hit=0, l2_hit=256, load_ms=25.96, first_sched=32, 8 tokens |
+| Output Correctness | PASS | Cold vs CPU HIT 输出 token **exact match** |
+| Case D: CPU MISS Fallback | PASS | last_cpu_hit=None, first_sched=528 (全量), 正常生成 |
+| Partial Prefix | PASS | cached [A,B,C,D] query [A,B,X,Y] → l2_hit=2 (只 A/B), first_sched=32 |
+| Shared Prefix R1/R2/R3 | PASS | [A,B,C,D]/[A,B,C,X]/[A,B,Y] → CPU 4→5→6 块, 无重复/泄漏 |
+| Shared 无泄漏 | PASS | cpu_pool used == index len |
+| RollbackA: alloc 不足 | PASS | 注入 _allocate_block 失败 → ok=False, fallback 全量 prefill (first_sched=4112), 不崩 |
+| RollbackB: load 异常 | PASS | 注入 load_prefix 异常 → ok=False, fallback 全量 prefill, 不崩 |
+
+Case C 核心：TTFT=108.85ms vs Cold 437.56ms，CPU load 25.96ms，256 blocks loaded，suffix 32 tokens 正确 prefill，8 tokens 生成，输出 `[8195, 8326, 8457, 8588, 8719, 8850, 8981, 9112]`。
+
+---
+
+## §12 性能基准结果（sync_scheduler_prefix_hit.csv）
+
+prefix_len ∈ {512, 1024, 2048, 4096}, suffix=32, repeat=3 取中位数：
+
+| prefix_len | cold_ttft_ms | cpu_hit_ttft_ms | l2_hit_blocks | cpu_load_ms | cpu_lookup_us | ttft_speedup | prefill_saved |
+|---|---|---|---|---|---|---|---|
+| 512 | 82.56 | 85.04 | 32 | 3.51 | 10.6 | 0.97x | 512 |
+| 1024 | 114.20 | 88.49 | 64 | 6.65 | 21.3 | 1.29x | 1024 |
+| 2048 | 215.61 | 95.38 | 128 | 13.00 | 28.6 | 2.26x | 2048 |
+| 4096 | 435.75 | 111.21 | 256 | 25.60 | 53.6 | 3.92x | 4096 |
+
+**关键观察**：
+- CPU HIT TTFT 随 prefix_len 几乎不增长（85→111ms），因只 prefill 32-token suffix；Cold TTFT 随 prefix_len 线性增长（82→436ms）。
+- **Break-even ≈ 1024 tokens**：prefix ≥ 1024 时 CPU HIT 净收益为正（speedup > 1）。512 时 Load 开销（3.5ms）与省下的 prefill（~30ms）接近，speedup 0.97（噪声级）。
+- 4096 prefix：TTFT 435.75→111.21ms（**-74.5%, 3.92x**），省 4096 token prefill，代价 25.6ms CPU Load。
+- CPU lookup 微秒级（10–54µs），非瓶颈；Load 是 CPU 路径主要开销，与 block 数线性（~0.1ms/block）。
+
+---
+
+## §13 状态一致性与风险检查（§三十一）
+
+| 风险 | 防护 | 验证 |
+|---|---|---|
+| L2 Load 后 block_table 未更新 | `allocate_prefix` 写 block_table | Case C first_sched=32 ✓ |
+| num_cached_tokens 过早更新 | 仅 Load+commit 成功后设 | RollbackA/B 不崩 ✓ |
+| hash_to_block_id 指向未 ready block | commit 在 Load 同步成功后 | Output Correctness exact match ✓ |
+| L2 分配与 suffix 分配冲突 | 同 `allocate_prefix` 顺序分配 | Shared 无泄漏 ✓ |
+| finish 后重复 free | Store 在 deallocate 前, deallocate 一次 | Shared used==index ✓ |
+| partial block 当 cached | `collect_store_blocks` 排除末块 | Partial l2_hit=2 ✓ |
+| L1+L2 重复计数 | L2 从 l1_hit 起查, 不重查 L1 | Case B L1 覆盖 CPU 不查 ✓ |
+| 0-token prefill 崩溃 | L2 上限 num_blocks-1 | Output Correctness 修复后 PASS ✓ |
+| 跨流可见性 | `torch.mlu.synchronize()` | Case C 输出正确 ✓ |
+| int32 advanced-index 限制 | pack=`B`(index_select)/unpack=`contig_run`(slice) | 23590-block mlu_kv 稳定 ✓ |
+
+---
+
+## §14 已知限制 / 未实现（阶段约束内）
+
+- **同步 Store**：Request 完成时同步 D2H，占用 decode 末步时间（4096 prefix Store ~19.8ms）。未做 async（约束）。
+- **无 LRU/ARC**：CPU pool 满即整批 skip（§二十六），不淘汰。长跑下 CPU pool 耗尽后新 prefix 不再缓存。
+- **无 refcount/pending**：CPU block 无引用计数，hash 去重保证不重复占块，但不支持多 seq 共享同一 CPU block 的安全释放。
+- **单流 Load**：Load 在请求调度路径同步执行，阻塞该 step；未做 background worker（约束）。
+- **host 带宽**：Load 的 H2D 受 host→device 带宽限制（~0.1ms/block），大 prefix 时是 CPU 路径主要开销（与 PoC probe 一致）。
+- **TP>1**：仅验证 TP=1；TP>1 需每 rank 独立 CPU backend（未测）。
+
+---
+
+## §15 结论与裁决
+
+第五步目标全部达成：
+1. ✅ BlockManager / Scheduler 同步接入（最小侵入，原 L1 行为不变）
+2. ✅ 第一次真实 CPU Prefix HIT（Case C：L1 MISS + L2 HIT，256 blocks Load，suffix prefill）
+3. ✅ 查询顺序 L1→L2→Prefill（CPU 不覆盖 MLU 命中，Case B 验证）
+4. ✅ Store 在 deallocate 前（§六）
+5. ✅ Load 失败安全 rollback（RollbackA/B 不崩，fallback 全量 prefill）
+6. ✅ 输出正确性 exact match（Cold vs CPU HIT greedy）
+7. ✅ 真正 L1 MISS + L2 HIT 构造（reset_l1_cache，不破坏状态）
+8. ✅ 测试 512/1024/2048/4096 prefix 全覆盖
+9. ✅ sync_scheduler_prefix_hit.csv + 本报告交付
+10. ✅ 阶段约束严格遵守（无 async/LRU/refcount/worker/kernel/layout 改动）
+
+**性能**：4096 prefix TTFT -74.5%（3.92x），break-even ≈ 1024 tokens。
+
+---
+
+## 十二个问题
+
+**Q1: CPU Prefix HIT 是否真正发生在真实请求链路（非 mock）？**
+是。测试直接驱动 `LLMEngine.step()` → `Scheduler.schedule()` → `ModelRunner.run()`，走真实 prefill/decode/attention。Case C `last_cpu_hit` 非空且 l2_hit=256，CPU Load 25.96ms 实际执行。
+
+**Q2: 查询顺序是否严格 L1→L2→Prefill？CPU 是否会覆盖已有 MLU 命中？**
+严格 L1→L2。`can_allocate` 先得 L1 命中 `num_cached_blocks`，`_cpu_lookup_and_load` 从 `l1_hit` 起查 L2（`remaining_hashes[l1_hit:]`），不重查 L1 命中块。Case B（L1 已覆盖 256 块）`last_cpu_hit=None`，CPU 不承担主路径。
+**Q3: Store 是否在 deallocate 之前执行？为何这个顺序关键？**
+是。`postprocess` FINISHED 分支：`_store_to_cpu(seq)` → `block_manager.deallocate(seq)`。关键：deallocate 释放 MLU block 后其 KV 可能被新请求覆盖，Store 必须在源 KV 仍有效时做 D2H（§六）。
+
+**Q4: Load 失败时如何保证请求不崩并 fallback？**
+两条路径：(a) alloc 失败 → `deallocate(seq)` 回退 partial 分配，清 num_cached_tokens，返回 False；(b) load 异常 → `rollback_cpu_hit` 释放占位块，清 block_table/num_cached_tokens，返回 False。两者均 `last_cpu_hit={ok:False}`，Scheduler 用原 L1 `num_cached_blocks` 走 `allocate(seq, l1_hit)` 全量 prefill。RollbackA/B 验证不崩且有输出。
+
+**Q5: 输出正确性如何保证 Cold 与 CPU HIT exact match？**
+greedy decoding（temperature=0.001，torch_mlu_ops.random_sample 确定性，跨 20 次运行一致）。CPU HIT 路径 Load 的 KV 与 Cold prefill 计算的 KV bit-exact（KVBlockMoverV2 已验证 bit-exact），故 attention 复用历史 KV 产生相同 logits → 相同 token。Output Correctness 测试 cold2==cpu2 PASS。
+
+**Q6: 如何构造真正的 L1 MISS + L2 HIT 而不破坏状态？**
+`reset_l1_cache()` 重建空 BlockManager（hash_to_block_id 空 + free_list 全满），保留同一 cpu_prefix backend（CPU index/pool 不变）。Request A Cold prefill + Store 到 CPU → reset_l1_cache → Request B 同 prefix → L1 空（MISS）+ CPU 有 prefix（HIT）。不手动清 hash_to_block_id 或破坏 free_list（§十五/十六）。
+**Q7: L2 命中上限为何是 num_blocks-1 而非全部完整块？**
+与 `can_allocate` 的 `range(num_blocks-1)` 一致：始终保留最后一个 block 给 prefill 产生首 token。若 L2 命中末块（当末块为 full 时 num_full_blocks 会多算 1），L1+L2 覆盖全部 full block → num_tokens=0 → 0-token prefill → flash_attention 崩溃。统一用 num_blocks-1 封顶避免此 edge case。
+
+**Q8: 跨流可见性如何处理？Load 在哪个 stream，prefill 在哪个 stream？**
+Load 写 mlu_kv 在 `KVBlockMoverV2.transfer_stream`，prefill 读 mlu_kv 在默认 stream。Load 后 `torch.mlu.synchronize()` 做设备级同步，保证 transfer_stream 的写对默认流可见。缺此同步会读到 stale KV → 输出错乱。
+
+**Q9: int32 advanced-index 限制如何影响实现？如何规避？**
+MLU advanced-index gather（`mlu_kv[:,:,idx]`）当 `mlu_kv.numel() > 2^31`（int32 index 上限）时失败。真实 engine mlu_kv 23590 blocks = 51.8GB = numel > 2^31。规避：pack 用 `index_select`（int64-safe），unpack 用 `contig_run`（slice-based，无 advanced-index）。已验证 index_select 在 23590-block mlu_kv 稳定。
+
+**Q10: CPU block 是否会重复占用？Shared prefix 场景如何去重？**
+`store_blocks` 逐 hash 查 index，已命中跳过（不申请新 CPU block）。Shared 测试：[A,B,C,D]→4 块，[A,B,C,X]→新增 1（X）共 5，[A,B,Y]→新增 1（Y）共 6，A/B/C 重复 prefix 不重复占块。`cpu_pool.num_used_blocks() == len(be.index)` 验证无泄漏。
+
+**Q11: 性能 break-even 点在哪？何种场景适合启用 CPU Prefix Offload？**
+break-even ≈ 1024 tokens（speedup 1.29x）。prefix ≥ 1024 时 CPU HIT 净收益为正；512 时 Load 开销与省下 prefill 接近（0.97x，噪声）。适合：长 prefix 重复请求（如 system prompt / few-shot 模板），prefix ≥ 1K tokens，L1 容量不足以常驻全部 prefix。短 prefix 或无重复场景不建议启用。
+
+**Q12: 本步未实现哪些功能？下一步可演进方向？**
+未实现（阶段约束）：async Store/Load、LRU/ARC 淘汰、refcount/pending、background worker、Active KV Offload、SSD/三级 Cache。下一步可演进：(1) async Store（decode 末步后台 D2H，不阻塞）；(2) LRU 淘汰使 CPU pool 长跑可用；(3) Active KV Offload（running seq 的 KV 搬 CPU 释放 MLU 容纳更多并发）；(4) 多级 Cache（CPU→SSD）。
+
+---
+## 最终裁决
+
+### **A. PASS**
+
+理由：
+- 31/31 集成测试全通过（含核心 Case C CPU HIT、Output Correctness exact match、RollbackA/B、Partial/Shared）。
+- 真实请求链路 CPU Prefix HIT 闭环达成（非 mock）。
+- 查询顺序 L1→L2→Prefill 严格，CPU 不覆盖 MLU 命中。
+- Store 在 deallocate 前，Load 失败安全 rollback，请求不崩。
+- 性能：4096 prefix TTFT -74.5%（3.92x），break-even ≈ 1024 tokens。
+- 阶段约束严格遵守（无 async/LRU/refcount/worker/kernel/layout 改动）。
+- sync_scheduler_prefix_hit.csv + 本报告完整交付。
+
