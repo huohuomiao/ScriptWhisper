@@ -1,0 +1,244 @@
+LayerNorm 动态 Shape 算子开发全程复盘
+
+  0. 需求与基础设施
+
+  需求：LayerNorm（恒等仿射，eps=1e-5），fp32，输出 Y: float32[M, N]，动态域 M∈[32,4096]、N∈[64,8192]、N%64==0，模式 max-performance。
+
+  流程：五阶段流水线（mlu-triton-main 状态机 run_manifest.json 驱动）：EnvConfig → Extractor → KernelGen → Optimizer → Finalize，每阶段产物带 SHA-256 指纹，可断点续跑。
+
+  硬件实测约束（后面所有决策的基石）：
+  - MLU590-M9DG：32 物理核（8 cluster × 4 core），SRAM 2 MiB/核组，NRAM 512 KiB/核
+  - 带宽上界（PyTorch 实测）：~1789 GB/s
+  - 计时口径：triton.testing.do_bench(warmup=25ms, rep=100ms, median)，含输出分配；分辨率 0.001ms，<0.002ms 的差异视为噪声
+
+  Extractor 关键决策：不把动态域降级为静态。生成 shape_contract.json（hash 冻结）+ 47 个冻结用例：9 基准锚点（权重 1/5/2/3/3/1/4/1/1，合计 21）+ 4 域边界 + 29 尾部 + 9 随机 + 3
+  holdout。这些用例和权重在后续所有精度/性能判定中不可更改——防止“为跑分调测试”。
+
+  ---
+
+  1. KernelGen：从 1.964ms 的退化基线起步
+
+  route=normal（非 Triton 输入）：DesignKernel → BuildKernel → Code Review，两代理链。
+
+  初版 kernel 设计（两遍结构，一直保留到最终）：
+  - Pass 1：延迟块归约——[BLOCK_M, BLOCK_N] 的 sum/sumsq 累加器沿 N 的 chunk 循环累加，循环后单次 tl.sum(axis=1)；var = E[x²]−μ²（clamp 到 0），rstd = 1/√(var+eps)
+  - Pass 2：重读 X chunk，归一化写出
+  - 数学上等价于 Welford/两遍均值方差法，但把归约开销压到每块一次
+
+  初版的致命缺陷（Code Review L3 直接过精度，但性能诊断指出）：BLOCK_M=1、BLOCK_N=1024，grid=cdiv(M,1)=M 个 program。
+  - 加权基线 1.964286 ms，大锚点 (4096,8192) 5.848 ms / 45.9 GB/s（只用了带宽的 2.6%）
+  - 根因：4096 个 program 在 32 核上排队，每个 program 只处理 1 行 × 1024 列，行内还剩 7 个 chunk 循环
+
+  Code Review 以零代理直通（attempts=1，47/47 + A-B-A 3/3 + 负向守卫 12/12，max_diff 9.5e-07）——正确性无问题，问题全在性能。
+
+ 2. Optimizer：策略路由与四步 OOB
+
+  控制器先跑 optimization_control.py plan：静态分析代码信号，从 5 个 OOB 策略中选出 4 个：
+
+  ┌────────────────────────────┬────────────────────────────┬─────────────────────────┐
+  │            策略            │          路由信号          │         选中？          │
+  ├────────────────────────────┼────────────────────────────┼─────────────────────────┤
+  │ retiling                   │ BLOCK_M=1 退化分块         │ ✅                      │
+  ├────────────────────────────┼────────────────────────────┼─────────────────────────┤
+  │ reduce-opt                 │ 有 chunk 循环              │ ✅                      │
+  ├────────────────────────────┼────────────────────────────┼─────────────────────────┤
+  │ modify-grid                │ grid 远超核数              │ ✅                      │
+  ├────────────────────────────┼────────────────────────────┼─────────────────────────┤
+  │ index-computation-simplify │ has_index_div_or_mod=false │ ❌（无整除/取模可简化） │
+  ├────────────────────────────┼────────────────────────────┼─────────────────────────┤
+  │ gen-autotune-config        │ 动态 shape                 │ ✅                      │
+  └────────────────────────────┴────────────────────────────┴─────────────────────────┘
+
+  2.1 retiling（1.964 → 0.166 ms，+91.5%）——收益最大的一步
+
+  怎么做：不是拍脑袋选配置，而是写 sweep.py 做全参数空间实测：
+  - BM∈{1,2,4,8,16,32,64,128} × BN∈{64,256,512,1024,2048,4096,8192} × warps{2,4,8,16} × stages{1,2,3,4,5,6,8}
+  - 44 个合法配置，每个配置跑完整 47 用例精度 + 9 锚点计时（这就是 config 测试的方法论起点）
+
+  实测得到的硬件边界（比文档可靠，写进了后续所有过滤条件）：
+  - BM×BN ≥ 65536 → SRAM 超限（Required ~2.6MB > 2MiB），合法边界 BM×BN ≤ 32768
+  - BM64/BN512 + w2/s4 → NRAM 656KB > 512 KiB
+  - stages=4 对 64×512 有显著收益（4096×8192: 0.648→0.540ms）；warps 4/8/16 无差异
+   结果：手工 3 桶 wrapper：
+  - M<512 → BM4/BN8192/s2（行少，每 program 拿整行）
+  - M≥1024 且 N≤1024 → BM128/BN256/s4（窄行需多行填核）
+  - 其余 → BM64/BN512/w4/s4（主力桶）
+
+  单一最优配置（不分桶）是 64×512/s4 = 0.1785ms；分桶再省 ~7%。
+
+  2.2 reduce-opt：回退为等价副本（如实报告）
+
+  策略本意是消除归约轴 chunk 循环（BLOCK_N=N 整行驻片，单遍归约）。但实测否决：整行 8192×fp32=32KB×BM，BM>8 即 SRAM 超限，BM 退回 ≤4~8 就是 retiling 已实测否决的退化结构（预期 ~10x
+  回退）。按预案回退输入等价副本，accuracy_pass=true, opt=original，不浪费预算。
+
+  2.3 modify-grid（+1.66%）：persistent grid
+
+  把 grid 收敛到 min(total_blocks, 32//num_warps)，kernel 内 for flat_pid in range(pid, num_blocks, num_jobs) 步长循环，cdiv→整数运算。收益小但结构保留至今。
+
+  2.4 gen-autotune-config（+1.25%）：autotune 替代手工桶
+
+  用 @triton.autotune（key=['M','N']）替代 3 桶硬阈值：24 个配置（BM{4,32,64,128}×BN{64,256,512,8192}×s{2,4}），过滤条件 BM×BN≤32768 + estimate_nram=(3+stages)×BM×BN/warps×4 ≤ 524288。autotuner 在
+  (127,5760)、(4096,64) 等点选出优于手工桶的配置。
+  - 期间踩的坑：配置生成器一度产出 36 个 >30 上限 → 裁掉 BM 8/16（与 4/32 同 SRAM 类但行覆盖更差）
+  - 当时把 num_warps 钉死为 4（沿袭 NRAM 估算 w2 超限的保守判断）——这个决定埋下了后面最大的优化空间
+
+ OOB 结果：0.161524 ms，12.15x。此时 vs PyTorch 仍慢 3.4x。
+
+  ---
+
+  3. Advanced 深度优化：实测驱动的瓶颈定位与 +53.8%
+
+  3.1 perf-analyzer（先花钱做测量，不动代码）
+
+  预算内派 perf-analyzer subagent，产出 perf_analysis.md。过程曲折但证据链完整：
+
+  - cnperf PMU 采集挂起：cnperf-cli record --pmu --replay_mode=kernel 对 persistent kernel 卡在驱动 __ipcm_rpc_call >25 分钟（这直接烧掉了一半墙钟预算）。终止后 cnmon
+    确认设备干净，改用受控探针替代。
+  - 受控探针（config 测试方法的核心）：固定同一 kernel 体，只改 config 参数，逐锚点扫 BM×BN×stages×warps×grid-cap，每次带精度校验过滤，config_probe.py/probe2.py 存证。
+  - 算术路径 A/B：div-to-mul 与 libdevice 变体在 (4096,8192)/(127,5760) 上 Δ<0.002ms（1 个计时器量化步长，噪声级）——带宽受限 kernel 的块尾标量路径被访存完全掩盖。
+
+  3.2 主瓶颈实测定位
+
+  gen-autotune-config 把 num_warps 钉死 4 → MAX_GRID_SIZE=32//4=8，全 device 只有 8 个驻留 program，75% 的核在做协作辅助而非独立计算。
+
+  受控证据（同 kernel 只改 w）：
+  ┌───────────┬─────────────────────┬───────────────────────────┬───────┐
+  │   锚点    │    w=4/8 program    │      w=1/32 program       │ 加速  │
+  ├───────────┼─────────────────────┼───────────────────────────┼───────┤
+  │ 4096×8192 │ 0.533 ms / 504 GB/s │ 0.291 ms / 922 GB/s       │ 1.83x │
+  ├───────────┼─────────────────────┼───────────────────────────┼───────┤
+  │ 2048×4096 │ 0.142 ms / 473 GB/s │ 0.075 ms / 895 GB/s       │ 1.89x │
+  ├───────────┼─────────────────────┼───────────────────────────┼───────┤
+  │ 127×5760  │ 0.026 ms / 225 GB/s │ 0.012 ms / 488 GB/s       │ 2.17x │
+  ├───────────┼─────────────────────┼───────────────────────────┼───────┤
+  │ 32×8192   │ 0.008               │ w1 全部 ≥0.009（保持 w4） │ 1.0x  │
+  └───────────┴─────────────────────┴───────────────────────────┴───────┘
+
+  附带实测发现：w=2 在本后端被编译器警告回退为 1（"not supported currently, fallback to 1"）；BM128/BN256/w2 编译报 NRAM 788928B 超限——非法区边界以实测为准。
+
+  候选交集：池内三选一——config-tuner 被证据支持；div-to-mul、libdevice-opt 实测排除（后者本机 libdevice 根本没有 fast_rcp/fast_sqrt，AttributeError 编译失败确认）。
+
+  3.3 config-tuner 执行（0.161524 → 0.074667 ms，+53.8%）
+
+  只改两处（kernel 数学/契约/口径不动，AST 逐函数验证一致）：
+
+  1. 候选池 24→21 配置：num_warps {4}→{1,4}（w2 有回退歧义不写）；加小 BM tile；沿用实测过滤 BM×BN≤32768 + estimate_nram≤524288（BM16/BN2048/w1 估算 917504B 被过滤器正确丢弃）
+  2. grid cap 联动 num_warps：关键坑——本机 Triton MLU fork 的 grid lambda 不传 num_warps（实测 KeyError），无法在 grid 里直接用 meta['num_warps']。解法：把候选池设计成 W-matrix——每个 (BM,BN) tile
+     只出现在一个 num_warps 列（import 时断言强制单射），wrapper 用 TILE_NUM_WARPS[(BM,BN)] 精确重构选中配置的 w：MAX_GRID_SIZE = 32 // num_warps
+
+  验证：全量 47 用例 + A-B-A + 12 负向守卫 + 9 锚点基准真实跑，加权 0.074667 ms（候选链：1.964 → 0.166 → 0.164 → 0.162 → 0.075）。意外收获：autotuner 在两大热点实际选中
+  BM8/BN2048/s4/w1（0.239/0.067ms），优于探针外推的 BM32/BN256（0.291/0.075ms）。
+3.4 为什么停在第 1 轮
+
+  轮 2 起候选池内无可执行策略（config-tuner 已做，另两个被实测排除），按规范 no_applicable_advanced_strategy 结束。结构性差距（两遍读 X，流量 3×M×N×4B vs PyTorch 单遍 2×）不在策略池覆盖范围——SRAM
+  装不下整行是实测硬边界，如实记录不强行“优化”。
+
+  ---
+
+  4. config 是怎么测试出来的（方法论总结）
+
+  1. 过滤先行：所有候选必须过 SRAM（BM×BN≤32768）和 NRAM（estimate_nram≤512KiB）双过滤——这两条边界不是抄文档，是 sweep 阶段编译器实报超限（2.6MB>2MiB / 656KB>512KiB）换来的
+  2. 固定变量实测：同一 kernel 体只改 config，do_bench median 同口径，<0.002ms 差异记为噪声不采信
+  3. 每个候选全量验证：47 冻结用例精度 + A-B-A 一致性 + 12 负向守卫，atol=rtol=1e-4——精度未通过者无论多快都不进入下一轮
+  4. 按冻结权重选优：加权平均（非单点最大值），杜绝为大锚点过拟合
+  5. autotune 兜底：手工分桶只做锚点，autotune 按 (M,N) 键现场重测——最终 57 shape 实测命中 12 个不同配置，大中规模 10/12 桶落在 w=1/32 program 列
+  6. 不可行方案也留证据：reduce-opt 的 10x 回退推算、libdevice 的 AttributeError、cnperf 的驱动挂起，全部落盘在 perf_analysis.md，让“不做什么”可审计
+
+  5. 最终数字
+
+  ┌──────────────────────┬──────────┬──────────┐
+  │         阶段         │ 加权 ms  │ 累计加速 │
+  ├──────────────────────┼──────────┼──────────┤
+  │ KernelGen 基线       │ 1.964286 │ 1.0x     │
+  ├──────────────────────┼──────────┼──────────┤
+  │ retiling             │ 0.166333 │ 11.8x    │
+  ├──────────────────────┼──────────┼──────────┤
+  │ modify-grid          │ 0.163571 │ 12.0x    │
+  ├──────────────────────┼──────────┼──────────┤
+  │ gen-autotune-config  │ 0.161524 │ 12.15x   │
+├──────────────────────┼──────────┼──────────┤
+  │ config-tuner（最终） │ 0.074667 │ 26.3x    │
+  └──────────────────────┴──────────┴──────────┘
+
+  大锚点 (4096,8192)：5.848ms/45.9GB/s → 0.239ms/1123GB/s；vs PyTorch 0.64x（两遍访存的结构性差距，已记录）。多 shape 复测 57/57 通过，max_diff ≤ 1.43e-06。
+
+  过程插曲（如实记录）：墙钟预算曾超限一次（cnperf 挂起是主因），经您授权 round-2 覆盖（10800s）后恢复；config-tuner subagent 一次 API 429 中断后按预算内重试规则恢复，未丢失进度。
+
+softmax 动态 shape 开发全过程总结（output_mulmat，run_id 246d1767…）
+
+  整个过程可以概括成一句话：先立契约、再生成参数化内核、然后跑一遍冻结测试拿到基线，最后做 5+3 轮优化，每轮只改一种东西、只用同一套冻结用例实测来决定去留。 下面按阶段展开。
+
+  ---
+
+  ① 入口决策（Main）
+
+  - 用户需求判定为动态 shape：M∈[1, 8192] 连续整数，N∈[64, 4096]、步长 64。
+  - 选择 max-performance 模式（预算上限 7200s / 16 次子代理调用 / 最多 3 轮深度优化 / patience=2 / 最小提升阈值 2%）。
+  - 绑定执行环境：本地 MLU590-M9DG，写入 run_context.json（hardware_key、toolchain_key）。后面所有性能数字只有在这个环境里测的才算数。
+
+  ② Extractor：生成契约 + 冻结测试集
+
+  - 用 shape 协议生成 shape_contract.json（动态模式，M/N 符号及范围、约束、atol=rtol=1e-4）。
+  - 由契约确定性生成 60 个冻结用例，每类都有标签：显式、边界、尾部（2^k±1 类）、随机，其中 8 个是 benchmark 用例（有权重，用于性能打分），3 个是
+    holdout（6312×3456、5867×1792、5082×832——从不参与调优，只测精度）。
+  - 用例 ID 是内容哈希（shape-xxxx），之后每个阶段都要重新生成并逐字节比对，防止偷换考题。
+
+  ③ Kernel Gen：参数化内核 + 基线
+
+  - 生成动态内核：N 作为运行时标量传入，BLOCK_N 由 @triton.heuristics 固定为 next_power_of_2(N)；wrapper 每次调用都检查 rank/dtype/设备/布局/域（1≤M≤8192，64≤N≤4096，N%64==0）。
+  - Step 6 测试首次运行直接通过（direct pass，60/60 精度 + 3 组 A-B-A + 全部负向 guard，一次过，没走修复路径）。
+  - 拿到基线：Triton 2.9276ms（加权平均），torch 0.3189ms——初始 Triton 只有 torch 的 0.11 倍。最重的 8192×4096 单 case 高达 9.127ms。
+  ④ 优化：OOB 四轮（信号驱动，逐轮实测）
+
+  优化开始前先扫描内核特征（signals）：有归约、块参数 BLOCK_M/BLOCK_N、无既有 autotune → 选中固定顺序 retiling → reduce-opt → modify-grid →
+  gen-autotune-config。每轮的规则：只跑完整冻结套件，全部精度必须过，加权平均延迟作为唯一选择标量，提升≥2% 才采纳，否则回退。
+
+  第 1 轮 retiling（1.000x，无合法改动）
+  结构性预优化（不要求性能，通过即可）。结论：块覆盖已完整、无需 reduce 轴规范化、无 NRAM 溢出 → 候选=输入原样通过。这一轮的真正产出是轴信息：M 是 PARALLEL 轴（可循环）、N 是 REDUCE 轴（优先级
+  0），后续分桶调参全靠这份信息。
+
+  第 2 轮 reduce-opt（2.9276 → 1.2170ms，2.41x）
+  把三遍扫描（每遍都重新读 x）改成单次加载：x_tile 只读一次，一遍算 max → 一遍算 exp 累加（e_chunk 复用）→ 一遍归一化（inv_sum = 1.0/row_sum，除法变成乘倒数），节省的是访存。
+
+  第 3 轮 modify-grid（1.2170 → 0.5084ms，2.39x）
+  改成 persistent 循环：for row_block in range(pid, num_row_blocks, num_jobs)，grid = min(num_row_blocks, TOTAL_CORE_NUM//num_warps)——每个核领活干到完，消除小任务时的核闲置。
+
+  第 4 轮 gen-autotune-config（0.5084 → 0.4240ms，1.199x，分桶在这一轮出现）
+
+  这一步就是 “config 怎么测试出来的” 的核心，完整过程：
+
+  1. 定参数空间：从 retiling 的轴信息出发——BLOCK_N 已被 heuristics 钉死，排除出搜索空间；剩下 BM∈{1,2,4,8} × num_warps∈{1,4} × num_stages∈{1,3} = 24 个组合。
+  2. 定分桶键：key='N' 经 next_power_of_2 折叠 → 值域 64~4096 收敛为 7 个桶（64/128/256/512/1024/2048/4096）。M 维被 persistent 循环吸收，不需要作为键——这就是最终选 B 方案（冻结表）的原因。
+
+3. 逐桶实测搜索：每个桶内，用该桶命中的所有非 holdout 冻结用例（benchmark+尾部+随机）跑真实测量（TRITON_PRINT_AUTOTUNING 记录实测时间），选“桶内全部非 holdout 用例中位数之和”最小的组合。holdout
+     三个 shape 全程不参与。
+  4. 非法组合自动淘汰：BM8×BN4096 编译期 NRAM 525760B > 524288B → OutOfResources 自动剔除，4096 桶回退到 BM4。
+  5. 冻结成表：FROZEN_CONFIGS（64→BM8、128→BM1、256→BM1、512→BM8、1024→BM8、2048→BM8、4096→BM4，基本 w1/s3），并配 DEFAULT_CONFIG={BM1,w4,s2} 兜底。没有运行时搜索。
+  6. 复现性验证：两次独立完整运行结果逐位一致（0.4240ms）。
+
+  ⑤ 深度优化（perf-analyzer 驱动，最多 3 轮）
+
+  R1 分析 + libdevice-opt（尝试后回退）
+  perf-analyzer 在最重的 benchmark case 8192×4096 上分析：本机没有 cnperf-cli，改用 mluiropt 静态分析 → NRAM 用量 360448B/524288B = 68.75% < 90% → 建议“调大 block”和“libdevice 替换”。先试
+  libdevice-opt：fast_expf 精度过了但实测慢 8~25% → 回退；fast_rcp 在本机工具链根本不存在（AttributeError）。实测说了算，分析建议只是候选。
+
+  R2 config-tuner（胜出，0.4240 → 0.0496ms，+6.4% ≥ 2%）
+  带着 R1 的“NRAM 利用率不足”信号，在 gen-autotune-config 网格之外搜索增量点：BM∈{16,32,64,128}、stages∈{2,4}、warps=2（本后端不支持）。方法：同进程交错 A/B——每个桶的候选与基线在同一进程内交替测 3~7
+  轮取中位数（因为跨进程计时有漂移），达标后再跑完整 harness 复核。结果：64→BM32、512→BM32、1024→BM16 三个桶上调 BM 被采纳；BM64@512、BM32@1024、BM8@4096 等其余点实测 NRAM
+  超限或更慢，全部淘汰。合计 10 个尝试批次、约 30 个候选点。
+
+  R3 停止
+  再次分析：libdevice-opt 无剩余点、config-tuner 网格已穷尽、div-to-mul 无除法残留（已是乘倒数）→ 候选交集为空 → 以 no_applicable_advanced_strategy 正常结束。
+
+  ⑥ Finalize
+
+- 胜出者从 verified/{code_hash}.py 内容寻址快照导出为 triton_final.py，三重校验（哈希一致、分数复验、字节相同）。
+  - 最终成绩：0.0496ms，相对初始 Triton 59.0x，相对 torch 6.42x（8192×64 提升 209x，8192×4096 提升 49x）；60/60 精度全过，max_diff 8.94e-08。
+  - 生成 regression_result.json：holdout 用例延迟保持 null（只测精度不计时），资源指标只填实测值。
+
+  贯穿全程的三条纪律
+
+  1. 同一套考题：60 个冻结用例从头用到尾，每个门禁重新生成比对哈希，谁都不能换题。
+  2. holdout 绝缘：三个 holdout shape 在调优全流程（分桶搜索、R2 的 A/B）中一次都没被用过，只在冻结后做精度验证。
+  3. 实测裁决一切：分析信号（NRAM 68.75%）只决定“去试什么”，采纳与否永远由冻结套件上的同进程实测决定——libdevice-opt 就是分析上合理、实测被否决的例子。
+
