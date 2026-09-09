@@ -1,0 +1,207 @@
+（MLU Triton）
+
+  〇、总体架构
+
+  方案要求：由 4 个 Skill 分层编排——mlu-triton-main（主控）+ mlu-triton-code-gen（代码生成）+ mlu-triton-code-review（执行/修复/验证）+ mlu-triton-optimize（性能优化）。主流程通过 run_control.py
+  状态机管理 5 个外层阶段：
+
+  init → env_config → extractor → kernel_gen → optimizer → finalize → done
+
+  每阶段受三个机制保护：内容指纹与产物 SHA-256（失效向下游传播）、内容寻址缓存（.mlu-triton-cache/，断点续跑）、L1/L2/L3 验证等级（L1 结构校验、L2 schema 校验、L3 真实 MLU 执行证据）。主流程是
+  run_manifest.json 的唯一写入者；subagent 任务阻塞串行、禁止并发。
+
+  真实做了：两次运行都全新执行（无缓存恢复），每阶段 attempts=1，manifest 事件序列完全对应上述 DAG；两次都出现 fingerprint_changed 失效事件（env_config/extractor
+  完成后正常刷新下游指纹），无失败重试、无 not_comparable 记录。
+
+  ---
+
+  一、初始化（run_control init）
+
+  需要做什么：
+  - 识别任务类型 static / enumerated / dynamic（动态 shape 任务必须走 shape 协议）；
+  - 运行 run_control.py init --output-dir <dir> --input <需求文件或文本> --mode <optimization_mode>，确定 optimization_mode（correctness / balanced / max-performance）；
+  - 用户提供了契约文件时附加 --shape-contract；
+  - 不得用样例 shape 推断整个支持域；要求动态但未给范围时先补齐边界；
+  - 清单已存在时禁止再 init，必须 resume。
+
+  真实做了：两次都是 kind=literal 内联需求文本 + mode=max-performance，budget_file=null（未显式提供预算，使用 max-performance 模式默认值：wall 7200s / subagent 16 / worker 16 / strategy 12 /
+  advanced 3 / patience 2 / min_improvement 2%）。动态 rank、数据依赖输出长度、零维度大小被明确划出支持范围。
+
+  ---
+
+  二、阶段 1：EnvConfig 环境准备与验证
+
+  需要做什么：
+  - 先跑 next 确认 env_config/run，再 start；
+  - 强制顺序：本地依次执行 get_device_info.py 和 test_env_code.py，两者 exit 0 → execution_backend=local；任一失败则向远端 Worker 提交同一套检查（阻塞前台），都失败则停止并报告真实 stdout/stderr；
+  - 本阶段由 subagent 执行（禁止主流程接管）；永不从缓存恢复，每次运行重新确认设备；
+  - 产出 3 个产物：config.md（环境报告）、runtime_info.txt（检查输出原文）、run_context.json（稳定的 hardware_key / toolchain_key），随后 bind-context 绑定上下文。
+
+  真实做了：两次均本地通过、判定 execution_backend=local（MLU590-M9DG，NeuWare 4.6.2 / Triton 3.2.0 / torch_mlu 1.31.1 + torch 2.9.1），未使用 Worker。差异在于 hardware_key 记录口径：softmax 记为
+  MLU590-M9DG:1x81920MiB:FULL，RmsNorm 记为 MLU590-M9DG:1:80GiB:fw_v1.1.1:driver_v6.5.26——同一块卡的两次运行指纹表述不同，是跨 run 不可直接比绝对毫秒的一个原因。
+
+ ---
+
+  三、阶段 2：Extractor 需求抽取（动态 shape 的核心）
+
+  需要做什么：
+  - 由 subagent 按 Extractor.md 规范执行；
+  - 从用户需求（not_triton 文字描述或已有 Triton 代码）产出：requirement.md（规范化需求文档，含输入类型标记）、shape_contract.json（归一契约：shape_mode、符号域 min/max/step 或 multiple_of、IO
+    dtype/layout、采样参数、精度容限）、shape_cases.json（冻结测试用例套件，含 benchmark 权重、holdout、A-B-A 序列）；
+  - 契约与用例一经冻结即带 hash（shape_contract_hash / test_suite_hash），后续所有阶段不得改动；
+  - 缓存要求 L1+L2。
+
+  真实做了：
+
+  ┌────────────────┬────────────────────────────────────────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────┐
+  │                │                                    softmax                                     │                             RmsNorm                             │
+  ├────────────────┼────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ 契约域         │ M∈[1,8192] step 1；N∈[64,4096] step 64                                         │ M∈[1,2048]；N∈[128,8192] multiple_of 128                        │
+  ├────────────────┼────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ 冻结用例       │ 60 个：8 explicit（即 benchmark）+ 4 boundary + 43 tail + 9 random + 3 holdout │ 54 个：8 explicit + 4 boundary + 37 tail + 9 random + 3 holdout │
+  ├────────────────┼────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ benchmark 权重 │ 全部 1.0                                                                       │ 大 case 权重 3.0/2.0（2048×8192、2048×4096、512×4096 加权）     │
+  ├────────────────┼────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ 精度容限       │ atol=rtol=1e-4                                                                 │ atol=rtol=1e-4                                                  │
+  ├────────────────┼────────────────────────────────────────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ A-B-A 序列     │ 3 组                                                                           │ 3 组                                                            │
+  └────────────────┴────────────────────────────────────────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────┘
+
+  关键设计意图（两次都体现了）：tail 用例专门覆盖 2^k±1 形状的尾部越界；holdout 用例不参与任何调参，只做最终验证，防止调优过拟合到测试集；采样 seed 固定，保证可复现。
+
+  ---
+
+  四、阶段 3：KernelGen 代码生成（三组 checkpoint）
+
+  需要做什么——mlu-triton-code-gen Skill 按 normal（DesignKernel → BuildKernel → Code Review 两代理链）或 triton_fast（跳过设计）路由，分三组 checkpoint 落盘，每组要求相应验证等级后才可
+  checkpoint-save：
+
+  ① design 组（Step 1–4，仅 normal 路由，L1+L2）：
+   - Step1 step1_base_info.json：算子名、计算公式、torch 参考实现、IO 轴/dtype/stride、归约轴、符号域（与契约 hash 绑定）；
+  - Step1 step1_io_shapes.json：IO 形状明细；
+  - Step2 step2_block_mapping.json：逻辑轴 → block 参数映射（PARALLEL 轴挂 BLOCK_M，REDUCE 轴挂 BLOCK_N）；
+  - Step3 step3_axis_fusion.json：逐对检查相邻轴能否融合，归约边界/动态语义边界禁止融合，须给出明确理由；
+  - Step4 step4_code_spec.json：kernel 代码规格。
+  - 允许同上下文内 1 次自修复，再失败则停止、不得启动 Build。
+
+  ② build 组（Step 5–6，L1+L2）：
+  - Step5 step5_kernel_code.py：kernel + wrapper；
+  - Step6 step6_test_code.py：完整测试代码（输入构造、PyTorch 参考、torch.allclose、triton.testing.do_bench），只生成不执行；
+  - 要求 Step6 保持 Step5 的 kernel/wrapper、不得伪造任何精度/性能结果。
+
+  ③ review 组（Step 7，L1+L2+L3）——由主流程直接调 mlu-triton-code-review Skill（不进 subagent）：
+  - Code Review 拥有全部真实执行权：读取 EnvConfig 固定后端，真实 MLU 上跑全套件；
+  - 直接通过（零 agent）→ status=passed；业务失败（精度/执行错误）→ 分发 ReviewAndFix subagent 做保守最小修复（契约：step6_test_code.py →
+    step6_test_code_fix.py），修复后全量重跑；基础设施错误不得触发代码修复、不得产生可复用 checkpoint；
+  - 产物：step6_test_code_fix.py/.md、review_result.json（v2 schema：status / validation_level=l3 / accuracy.pass / 全部 expected_case_ids / code_hash / suite_hash）；
+  - 通过后复制为 triton_code_fix.py（👉 Optimizer 输入）、triton_report.md、dispatch_metrics.json。
+
+  真实做了：
+
+  - softmax：走 normal 路由（not_triton 输入），DesignKernel 产出 5 个 JSON。Step3 轴融合分析结论：M/N 不融合——N 是 dim=-1 归约轴，融合会破坏行边界语义和 row < M 掩码。Review
+    直接通过（status=passed，attempts=1，60/60 case + 3 A-B-A + 13 guard，max_diff=8.94e-08）。基线性能：Triton 2.9276 ms vs PyTorch 0.3189 ms（0.11x，初始版本反而慢 9 倍）。
+  - RmsNorm：同样 normal 路由。Review 首轮失败——step6_initial_failure.log 记录 import ast 缺失导致 NameError，触发 ReviewAndFix 最小修复 1 轮，全量重跑后通过（status=repaired，attempts=2，54/54 +
+    A-B-A 3/3 + guard 15/15，max_diff=9.5e-07）。基线：Triton 0.3028 ms vs PyTorch 0.0832 ms（0.27x）。
+
+ 这一步是全流程中“方案分支”最清晰的体现：同一个 review 阶段，softmax 走了零 agent 直接通过路径，RmsNorm 走了 1 轮修复路径，两者的 review_result.json（status=passed vs repaired）就是 L3 证据。
+
+  ---
+
+  五、阶段 4：Optimizer 性能优化
+
+  需要做什么——mlu-triton-optimize Skill，五步流程，一切动作受同一状态文件预算硬约束：
+
+  步骤 1 输入检查：确认输入含 @triton.jit kernel、launch、wrapper、精度测试、性能测试，缺一即停。
+
+  步骤 2 生成计划：运行 optimization_control.py plan，产出 optimization_plan.json（模式、静态信号、策略路由、预算）+
+  optimization_state.json（用量、最佳候选、patience、历史）。信号来自对代码的静态分析：有无归约、grid 维度、block 参数、autotune、除法、libdevice 候选等，据此静态路由 5 个 OOB 策略，只执行
+  selected=true 的。已存在 plan/state 时必须 --resume，禁止重建状态绕过预算。
+
+  步骤 3 OOB 策略串行执行（每策略：预算 check → 建目录 {n}_{策略}/、上一轮通过精度的代码复制为 input.py → record subagent → 分发 Optimizer subagent 只做该策略 → 校验产物 → 从报告取
+  accuracy_pass/original_ms/opt_ms → record strategy；精度不过的候选不得成为下一轮输入）：
+  1. retiling——分块重铺：block_size 全覆盖检查（每个逻辑轴必须有 block 参数且有效参与张量构建）、归约轴规范化；
+  2. reduce-opt——归约优化；
+  3. modify-grid——grid 展平/物理核封顶；
+  4. index-computation-simplify——无整除/取模则跳过；
+  5. gen-autotune-config——可调 constexpr 分块参数的 autotune/分桶固化。
+
+  OOB 完成后最近通过精度的候选 → triton_oob_optimized.py。
+
+  步骤 4 advanced 深度优化（仅 max-performance）：每轮 = 预算 check → perf-analyzer subagent 性能分析 → 分析建议与候选池（libdevice-opt / config-tuner / div-to-mul）取交集，空则
+  no_applicable_advanced_strategy 停止 → 执行一个候选 → 精度+性能实测 → 提升达 min_improvement_pct 才重置 patience，否则回退。产物 triton_advanced_optimized.py。
+
+步骤 5 最终选择与报告：选择顺序 = state.best（valid）→ advanced 赢家 → OOB 赢家 → 原始输入；复制为 triton_optimized.py + triton_optimized.md；每个精度通过的候选都存入 Optimizer/verified/（代码
+  hash-结果 hash 双文件证据）。
+
+  真实做了：
+
+  ┌─────────────────────┬──────────────────────────────────────────────────────────────────────────────────────────┬──────────────────────────────────────────────────────────────────────────────┐
+  │                     │                                         softmax                                          │                                   RmsNorm                                    │
+  ├─────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ 信号差异            │ block_params=[BLOCK_M, BLOCK_N]                                                          │ block_params=[BLOCK_N]（M 轴无块参数）                                       │
+  ├─────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ retiling            │ 不适用：基线已是二维 tile，三步规范检查全过，无修改项，1.00x 原样通过                    │ 有效 1.66x：一行一 program → 引入 BLOCK_M                                    │
+  │                     │                                                                                          │ 二维块、标量归约改按行向量、SHAPE_DISPATCH 逐桶固化 BLOCK_M                  │
+ ├─────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ reduce-opt          │ 2.41x：BLOCK_N 绑 next_power_of_2(N)，三趟归并单趟向量化归约                             │ 3.00x：同样消除归约循环 + 单次加载两遍复用                                   │
+  ├─────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ modify-grid         │ 2.39x：persistent kernel + 32 物理核封顶                                                 │ 1.16x：persistent grid 封顶 32 核                                            │
+  ├─────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ index-simplify      │ 跳过（计划未选中，无整除/取模）                                                          │ 跳过（路由判定无整除/取模）                                                  │
+  ├─────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+ │ gen-autotune-config │ 1.199x：按 N 桶搜索后固化 FROZEN_CONFIGS，无运行时搜索                                   │ 1.80x：逐桶实测 BLOCK_M×NUM_STAGES 固化为静态 SHAPE_DISPATCH                 │
+  ├─────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ advanced 轮次       │ 2 轮：第1轮 libdevice-opt（fast_expf 精度过但慢 8–25%，弃）；第2轮 config-tuner（NRAM    │ 0 轮：perf-analyzer 用 cnperf PMU 实测大 case 已达带宽墙（76.9–78.9%         │
+  │                     │ 占用 68.75%<90%，调大 BM，同进程 A/B +6.4%≥2%，采纳为最终赢家）；第3轮交集空停止         │ 利用率）、小 case 贴 ~1.5µs launch 地板，候选无 ≥2% 空间 → 立即停止          │
+  ├─────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ 最终赢家            │ config-tuner（来自 advanced）                                                            │ gen-autotune-config（OOB 即封顶）                                            │
+  ├─────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ 实际用量            │ subagent 9/16、strategy 7/12、advanced 2/3、worker 0                                     │ subagent 5/16、strategy 4/12、advanced 0/3、worker 1（perf-analyzer 期间）   │
+  ├ ├─────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ 最终性能            │ 0.0496 ms，vs 原始 59.0x，vs PyTorch 6.42x，带宽 ~1237 GB/s                              │ 0.0292 ms（加权），vs 原始 10.39x，vs PyTorch 2.85x，大 case 1813.8          │
+  │                     │                                                                                          │ GB/s（≈带宽墙 79%）                                                          │
+  ├─────────────────────┼──────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────────────────────────────────────────────────────────────┤
+  │ 精度复验            │ 优化后 60/60 + A-B-A + 13 guard 全过                                                     │ 54/54 + A-B-A + 15 guard 全过                                                │
+  └─────────────────────┴──────────────────────────────────────────────────────────────────────────────────────────┴──────────────────────────────────────────────────────────────────────────────┘
+
+  两次都出现了一个值得写进总结的机制差异：softmax 当时无 cnperf-cli 工具，advanced 判断只能靠同进程 A/B 计时；RmsNorm 有 kernel.cnperf-rep PMU 数据，“停止优化”的决策有硬件计数证据支撑。
+
+  ---
+
+  六、阶段 5：Finalize 最终交付
+
+  需要做什么（本阶段不缓存，确保总结反映真实恢复路径）：
+  1. 按模式确定最终源：max-performance/balanced 用 Optimizer/triton_optimized.py，correctness 用 KernelGen/triton_code_fix.py，原样字节写入 triton_final.py；
+  2. 写 summary.md，七项必含（缺一不可，缺失字段必须写 N/A（原因），禁止伪造）：①算子基本信息（名称/需求来源/执行位置/mode）②Code Gen 精度 ③Code Gen 性能基线 ④Optimize 结果（含 stop_reason、各 OOB
+     策略执行/跳过原因）⑤性能对比表 ⑥产物索引 ⑦运行恢复信息（逐阶段状态/attempts/cache/指纹，hardware_key/toolchain_key）；
+  3. 把真实 MLU 结果规范化为 regression_result.json（符合 schema，case_id 用稳定 shape-ID，缺失延迟写 null 不许写 0），供 Nightly/Release 门禁读取；
+  4. 交接验证三产物非空、schema 通过；结束前查询 active task 确认无遗留。
+   真实做了：两次的 triton_final.py 均与 Optimizer 赢家字节一致（softmax sha256 9dede486… 对应 config-tuner 赢家；RmsNorm sha256 563e717b…），summary.md 七项齐全。RmsNorm 的 regression_result
+  有一个值得强调的规范细节：只有 8 个 benchmark case 带 latency_ms，46 个精度用例 latency_ms=null——计时只针对锚点用例，不为凑字段伪造数据，这是回归门禁不会误判的关键。
+
+  收尾后的人工补充（流程外）：softmax 项目另写了 3 个 spot-test/benchmark 脚本（dynamic_spot_test.py 用冻结套件外的新鲜 shape 验证 guard 与分桶、bench_vs_fused_softmax.py 对比官方 fused
+  softmax、bench_extended.py 全域扫描），对最终交付做了套件外的独立抽检——全部通过，这属于使用者自发的验收动作，不是框架环节。
+
+  ---
+
+  七、贯穿全程的动态 shape 专项机制
+
+  这部分是“动态 shape 算子开发”区别于静态算子开发的核心，两次运行均已落实：
+
+  1. wrapper 全域 guard：每次调用检查 rank/dtype/设备/contiguous/域边界（softmax 13 项 guard、RmsNorm 15 项），域外输入显式拒绝而非静默转连续——负向 guard 测试是冻结套件的一部分；
+  2. 静态分桶调度（SHAPE_DISPATCH / FROZEN_CONFIGS）：按 N 桶固化 BLOCK 参数字面量，任意运行时 (M,N) 命中固定桶配置，无运行时 autotune 搜索（避免线上抖动），每个桶有无条件兜底；
+  3. holdout 隔离：3 个 holdout case 不参与调参只做验证，防止策略过拟合；
+  4. A-B-A 序列测试：3 组同 shape 重复调用验证无跨调用状态污染；
+  5. 证据链防伪：契约 hash → 套件 hash → 代码 hash → 结果 hash 层层绑定，verified/ 中每个候选都有代码+结果双 hash 文件，summary 缺数据必须显式 N/A（原因）；
+  6. 支持域声明：summary 明确“已测用例是有界证据，非全域证明”，动态 rank、零维、数据依赖输出长度不在支持范围。
+
+  ---
+  八、两次运行的流程一致性结论
+
+  同一套 skill（两个项目的 .claude/skills 字节级一致）驱动，两个算子产出了逐阶段对齐的目录结构（EnvConfig/ Extractor/ KernelGen/ Optimizer/ verified/ triton_final.py/ summary.md/
+  regression_result.json）。流程上的差异全部是“按需触发的分支”，而非步骤不同：ReviewAndFix 修复分支（RmsNorm 触发、softmax 未触发）、retiling 适用性分支（RmsNorm 改造、softmax 判定不适用）、advanced
+  迭代深度（softmax 2 轮、RmsNorm 0 轮即被 PMU 证据说服停止）。这验证了方案的核心设计：策略由静态信号路由、停止由预算和真实证据决定、每个结论都有 hash 绑定的 L3 证据。
+
+  ---
+
+  需要的话我可以把这份总结写入一个 markdown 文件（比如 /data1/dy_shape/动态shape算子开发方案总结.md），或者按你论文/汇报的格式要求再调整结构。
