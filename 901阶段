@@ -1,0 +1,374 @@
+# Quantized Hierarchical Prefix KV Cache PoC 报告
+
+> **日期**: 2026-08-23 · **硬件**: MLU590-M9DG (80GB) · **torch_mlu** 1.31.1
+> **模型**: Qwen3-8B (TP=1) · block_size=16 · L=36 · H=8 · D=128
+> **阶段范围**: 独立同步 PoC。新增 `CPUKVPoolV3Quantized` + `QuantizedKVBlockMover`, **未修改** Scheduler / BlockManager / Admission / LRU / Async Store / Async Load / Coalescing。
+
+---
+
+## 1. 当前 BF16 CPU L2 (V2)
+
+现有 `CPUKVPoolV2` + `KVBlockMoverV2` (Block-Major 布局): CPU 池 `(B,2,L,H,T,D)` bf16, 单 logical block 连续 ≈ 2.25 MiB, host 端零 reformat, pack/unpack 全在 device。这是本 PoC 的对照基线。
+
+| 张量 | shape | dtype | 单 block bytes |
+|------|-------|-------|----------------|
+| CPU V2 KV | `(B, 2, 36, 8, 16, 128)` | bfloat16 | 2,359,296 (2.25 MiB) |
+
+## 2. 当前 MLU INT8 L1
+
+通过 `kvcache_patch.py` monkey-patch 注入, 原版 attention/model_runner 一行不改。KV cache int8 + per-token-per-KV-head fp32 scale, 已验证 (容量 1.9394x, decode TPOT ~0.97~1.05x, prefix HIT dequant ~15ms)。
+
+| 张量 | shape | dtype | 说明 |
+|------|-------|-------|------|
+| MLU kv_cache | `(2, L, N, H, T, D)` = `(2,36,B,8,16,128)` | int8 | block 维 index 2 |
+| MLU kv_scales | `(2, L, N, H, T)` = `(2,36,B,8,16)` | float32 | per-token scale |
+| 单层 k_cache | `(N, 8, 16, 128)` | int8 | `module.k_cache = kv_cache[0,layer]` |
+| 单层 k_scale | `(N, 8, 16)` | float32 | `module.k_scale = kv_scales[0,layer]` |
+
+**关键约束**: `flash_attention` 不支持读 int8 cache (要求 q/k dtype 一致), 故 prefix-cache prefill 必须先 MLU 反量化成 compact bf16 (`_dequant_used_blocks`) 再传入。
+
+## 3. CPUKVPoolV3 Quantized 设计
+把 CPU L2 从 BF16 KV 改成 **统一量化格式**: 直接存 MLU native INT8 KV + FP32 Scale, **不做 BF16 dequant**。
+
+| 张量 | shape | dtype | 单 block bytes |
+|------|-------|-------|----------------|
+| CPU V3 KV | `(B, 2, 36, 8, 16, 128)` | int8 | 1,179,648 (1.125 MiB) |
+| CPU V3 Scale | `(B, 2, 36, 8, 16)` | float32 | 36,864 (0.0352 MiB) |
+| **合计** | | | **1,216,512 (1.1602 MiB)** |
+
+沿用 V2 的 Block-Major 思路: block 维提到最外层, `cpu_kv[id]` / `cpu_scale[id]` 各自连续, host 端零 strided reformat, H2D/D2H 直达最终 CPU 池。两个池都 `pin_memory=True`。
+
+**核心设计 (§三/§十八)**: 一个 logical CPU block 必须同时拥有 KV 和 Scale, 二者共用 **同一个 allocator 和同一个 cpu_block_id**。`allocate(i)` 同时拿到 `kv[i]` + `scale[i]`; `free(i)` 同时释放。结构上杜绝 `KV(A)+Scale(B)` 错配 —— allocator 只暴露单一 id, 不可能单独分配 KV 或 Scale。
+
+## 4. KV+Scale Block Layout
+
+```
+CPU V3 KV:    (B, 2, L, H, T, D)  int8      block 维最外层 → 每 block 连续
+CPU V3 Scale: (B, 2, L, H, T)     float32   block 维最外层 → 每 block 连续
+
+MLU native KV:    (2, L, N, H, T, D)  int8      block 维 index 2 (夹在 layer 内)
+MLU native Scale: (2, L, N, H, T)     float32   block 维 index 2
+V3 staging (mlu): KV (N,2,L,H,T,D) / Scale (N,2,L,H,T)   block 提到最外层
+```
+
+Store/Load 的 layout conversion (native ↔ block-major) 全部在 MLU/device 侧 (permute), CPU 端只做连续段直达 DMA。
+
+**Scale block id 与 KV physical block id 完全一致**: 二者共用同一组 `mlu_block_ids` / `cpu_block_ids`, 同一 pack 顺序, 同一 unpack 目标。`QuantizedKVBlockMover.pack_kv` / `pack_scale` 用同一 `mlu_ids` 和同一 `method`; `unpack_kv` / `unpack_scale` 写入同一 `mlu_ids`。验证见 §8。
+
+## 5. Capacity (§四)
+
+固定 Host budget, BF16 vs INT8+Scale block 数:
+
+| budget_MB | bf16_blocks | int8_blocks | bf16_tokens | int8_tokens | capacity_ratio |
+|-----------|-------------|-------------|-------------|-------------|-----------------|
+| 1024 | 455 | 882 | 7,280 | 14,112 | **1.9385x** |
+| 2048 | 910 | 1,765 | 14,560 | 28,240 | **1.9396x** |
+| 4096 | 1,820 | 3,530 | 29,120 | 56,480 | **1.9396x** |
+**capacity_ratio ≈ 1.9394x** (理论值, 误差 < 0.05%)。FP32 scale 占每 block 3.03%, 吃掉部分容量收益, 故非 2.00x。
+
+## 6. Quantized Store (§六)
+
+同步 Store: MLU native KV+Scale `{mlu_ids}` → device pack → 连续 V3 staging → D2H 直达 CPU V3 池。CPU 端 **不 dequant / 不 transpose / 不 strided reformat**。
+
+INT8 store 拆分 (device event, median):
+
+| blocks | pack_kv_ms | pack_scale_ms | d2h_kv_ms | d2h_scale_ms | total_store_ms |
+|--------|------------|---------------|-----------|--------------|----------------|
+| 64 | 0.47 | 0.21 | 2.14 | 0.08 | 2.98 |
+| 128 | 0.70 | 0.22 | 4.27 | 0.15 | 5.42 |
+| 256 | 1.12 | 0.23 | 8.54 | 0.28 | 10.26 |
+
+- `pack_scale` ~0.2ms (scale 量小, permute 快), `d2h_scale` 0.08~0.28ms (36KB/block × N)。
+- store 主导项是 `d2h_kv` (INT8 KV 本体 DMA), scale 是附加小开销。
+
+## 7. Quantized Load (§七)
+
+同步 Load: CPU V3 连续段 → H2D staging → device unpack → MLU native `{mlu_ids}`。**同一 `target_mlu_block_id` 同时接收正确 KV + Scale**。
+
+INT8 load 拆分:
+
+| blocks | h2d_kv_ms | h2d_scale_ms | unpack_kv_ms | unpack_scale_ms | total_load_ms |
+|--------|-----------|--------------|--------------|-----------------|---------------|
+| 64 | 3.00 | 0.10 | 3.07 | 0.20 | 6.48 |
+| 128 | 5.98 | 0.20 | 3.16 | 0.19 | 9.59 |
+| 256 | 11.94 | 0.38 | 3.65 | 0.20 | 16.24 |
+
+- `h2d_scale` 0.1~0.38ms, `unpack_scale` ~0.2ms —— scale 的 H2D+unpack 是固定小开销, 不随规模显著增长。
+- load 主导项是 `h2d_kv` (随 block 数线性增长) + `unpack_kv` (scatter, ~3~3.7ms 较平稳)。
+## 8. Physical Remapping (§八)
+
+`MLU src=[7,21,35,80] → CPU ids=[0,1,2,3] → MLU dst=[101,18,53,66]`, Store 前保存 orig, 清空目标后 Load, 验证 target KV == orig KV 且 target Scale == orig Scale。
+
+四种映射类型 × 规模 (1/4/16/64/128/256) × pack/unpack 方法交叉: **376 项全 PASS**, KV 与 Scale 都 bit-exact (`torch.equal=True`)。
+
+| 映射类型 | KV bit-exact | Scale bit-exact |
+|----------|--------------|-----------------|
+| contig→contig→contig | ✅ | ✅ |
+| contig→contig→random | ✅ | ✅ |
+| random→contig→contig | ✅ | ✅ |
+| random→contig→random | ✅ | ✅ |
+
+**Scale 也 bit-exact** (§九要求): scale 是 fp32, D2H/H2D 是纯字节搬运 + device permute, 无浮点运算, 故任意 physical remap 后 scale 与 KV 一样 bit-exact。
+
+## 9. KV/Scale Bit-exact
+
+见 §8。KV (int8) 与 Scale (fp32) 在所有 remap 场景下都 `torch.equal=True`。CPU Offload 全程无浮点运算 (纯 DMA + permute/copy), 不引入任何数值变化。
+
+## 10. BF16 vs INT8 Store (§十)
+
+同机器 / 同步计时 / median (warmup 5, repeat 20):
+
+| blocks | tokens | BF16_store_ms | INT8_store_ms | store_speedup | bf16_MB | int8_MB |
+|--------|--------|---------------|---------------|---------------|---------|---------|
+| 64 | 1024 | 5.114 | 2.972 | **1.72x** | 144.0 | 74.2 |
+| 128 | 2048 | 9.833 | 5.409 | **1.82x** | 288.0 | 148.5 |
+| 256 | 4096 | 19.293 | 10.237 | **1.88x** | 576.0 | 297.0 |
+
+Store speedup 随规模趋近 1.88x (数据量减半 + scale 附加小开销)。256 blocks 时 INT8 store 10.2ms vs BF16 19.3ms。
+
+## 11. BF16 vs INT8 Load (§十一)
+
+| blocks | tokens | BF16_load_ms | INT8_load_ms | load_speedup | bf16_MB | int8_MB |
+|--------|--------|--------------|--------------|--------------|---------|---------|
+| 64 | 1024 | 11.866 | 6.340 | **1.87x** | 144.0 | 74.2 |
+| 128 | 2048 | 18.314 | 9.664 | **1.90x** | 288.0 | 148.5 |
+| 256 | 4096 | 31.220 | 16.330 | **1.91x** | 576.0 | 297.0 |
+**4096-token Load: BF16 31.2ms → INT8+Scale 16.3ms (1.91x)**。从约 25~30ms 量级降到约 13~17ms 量级 —— **明确收益, 达到 <17ms "很好" 标准**。
+
+## 12. Host-device Traffic (§十二)
+
+4096 tokens (256 blocks):
+
+| 路径 | bytes | MB |
+|------|-------|----|
+| BF16 | 256 × 2,359,296 = 604,030,592 | **576.0 MB** |
+| INT8 KV | 256 × 1,179,648 = 301,990,912 | 288.0 MB |
+| FP32 Scale | 256 × 36,864 = 9,437,184 | 9.0 MB |
+| **INT8+Scale total** | 311,428,096 | **297.0 MB** |
+
+**traffic_reduction = (576 − 297) / 576 = 48.4%**。Host↔MLU 数据量从约 576MB 降到约 297MB, 与容量倍率 1.9394x 一致 (1/1.9394 ≈ 0.516, 即流量降到 51.6%, 减 48.4%)。
+
+## 13. Decode Restore Correctness (§十二/§十三)
+
+用真实算子 `quant_to_paged_cache` 生成 INT8 KV + scale → Store CPU V3 → 清空源 MLU → Load 到 dst blocks → `single_query_cached_kv_attn` 逐层 decode, 与 Store 前对比。
+
+| ctx_len | 逐层 exact match | max_abs | 无 NaN | 额外误差 |
+|---------|------------------|---------|--------|----------|
+| 64 | 36/36 | 0.00e+00 | ✅ | 无 |
+| 256 | 36/36 | 0.00e+00 | ✅ | 无 |
+| 1024 | 36/36 | 0.00e+00 | ✅ | 无 |
+| 4096 | 36/36 | 0.00e+00 | ✅ | 无 |
+
+§十三 端到端 (A 留 MLU vs B Store→Load): 逐层 exact match 36/36, max_abs=0。
+
+**CPU Offload 不增加额外量化误差**: Restore 前后 decode 输出 exact 一致 (max_abs=0)。因 CPU L2 存的就是 native INT8+Scale 的 bit-exact 副本, 无 dequant/requant。
+
+## 14. Prefix HIT Restore Correctness (§十四)
+
+CPU INT8 L2 HIT → Load 到 MLU → 现有 Prefix HIT 路径 (`_dequant_used_blocks` → compact bf16 → remapped block_tables → `flash_attention`), 与原 MLU INT8 Prefix HIT 对比。
+| ctx_len | 逐层 exact match | max_abs | 无 NaN |
+|---------|------------------|---------|--------|
+| 256 | 36/36 | 0.00e+00 | ✅ |
+| 1024 | 36/36 | 0.00e+00 | ✅ |
+| 4096 | 36/36 | 0.00e+00 | ✅ |
+
+**Restore 后 Prefix HIT 与原 INT8 Prefix HIT 完全一致** (bit-exact)。因 Restore 后 MLU 上的 INT8+Scale 与原 MLU 完全相同, dequant 路径输入一致, 输出必然一致。
+
+## 15. Prefix HIT TTFT (§十五)
+
+INT8+Scale L2 Load + dequant + suffix prefill 拆分:
+
+| ctx_len | blocks | load_ms | block_map_us | dequant_ms | suffix_prefill_ms | TTFT_ms |
+|---------|--------|---------|-------------|------------|--------------------|---------| 
+| 1024 | 64 | 6.27 | 210 | 13.51 | 15.50 | 35.56 |
+| 2048 | 128 | 9.61 | 208 | 13.39 | 15.44 | 38.70 |
+| 4096 | 256 | 16.27 | 211 | 13.44 | 15.53 | 45.53 |
+| 8192 | 512 | 29.60 | 216 | 15.19 | 17.68 | 62.77 |
+
+**关键判断**: `dequant_ms` 稳定在 **13.4~15.2ms** (36 层 × 2 = 72 次 `_dequant_used_blocks`, 与基线 ~15ms 一致), **不随 prefix 长度显著增长** (只反量化 used blocks, compact 大小随 ctx 增但 dequant 算子本身是 memory-bound, 增长平缓)。
+
+- Load 收益 (4096: 31.2→16.3ms, 省 14.9ms) **大部分被 dequant 13.4ms 抵消**: 4096 INT8 L2 的 TTFT (45.5ms) = load 16.3 + dequant 13.4 + suffix 15.5。
+- 对比 BF16 L2 (4096 load ~31ms) + 同样 dequant 13.4ms: BF16 L2 TTFT ≈ 31 + 13.4 + 15.5 = 59.9ms; INT8 L2 TTFT ≈ 45.5ms。**INT8 L2 仍省 ~14ms TTFT** (来自 load 段), 但 dequant 是固定开销, 占据 TTFT 的 ~30%。
+- **Quantized L2 不会让 TTFT 接近 2x**: dequant 13.4ms 是硬下限 (flash_attention 不支持 int8), Load 省下的 14.9ms 中约 13ms 被 dequant 吃掉, 净 TTFT 收益约 load 差额的 ~1/3。
+
+## 16. Peak Memory (§十七)
+
+staging 常驻 + compact BF16 临时峰值 (真实 peak counter, 非 36 层逻辑累计):
+
+| ctx_len | blocks | kv_staging_MB | scale_staging_MB | compact_logical_MB | compact_peak_MB | peak_GB |
+|---------|--------|---------------|------------------|---------------------|-----------------|---------|
+| 1024 | 64 | 630.0 | 19.69 | 4.0 | 11.35 | 1.815 |
+| 2048 | 128 | 630.0 | 19.69 | 8.0 | 18.38 | 1.834 |
+| 4096 | 256 | 630.0 | 19.69 | 16.0 | 36.13 | 1.873 |
+| 8192 | 512 | 630.0 | 19.69 | 32.0 | 72.25 | 1.951 |
+
+- **staging 常驻**: KV 630MB + Scale 19.69MB = 649.69MB (max 560 blocks, 预分配)。
+- **compact BF16 真实峰值** (§十七/§二十要求重新核实): 用 `max_memory_allocated` 减去 baseline (零 compact 的 flash_attention) 测得, 8192 时 **72.25MB**, 远小于逻辑累计 32MB × 36 层。说明 compact BF16 是逐层 dequant、用完即释放, **真实同时存活峰值 ≈ 单层 compact 的 ~2.2x** (k_compact + v_compact + flash 中间量), 不是全层逻辑累计量。
+
+## 17. Temporary BF16 Memory Recheck (§十七)
+
+**结论: compact BF16 真实同时存活峰值 = compact_peak_MB, 不是 36 层逻辑累计量。**
+
+- 逻辑累计 (36 层 × 2(k+v) × n × H × T × D × 2): 8192 时 32MB × 36 = 1152MB —— 这是错误的算法。
+- 真实峰值 (peak counter): 8192 时 72.25MB。逐层 dequant, 每层 `k_compact`/`v_compact` 在该层 flash_attention 后即无引用, MLU allocator 回收。峰值 = 单层 (k+v) compact + flash 中间 buffer, 约 2.2x 单层 compact。
+- **8192 的 72.25MB 是同一时刻真实峰值, 可接受** (远小于 staging 649.69MB 常驻)。
+
+## 18. Failure Handling (§九)
+
+错误注入测试 (KV ok / Scale fail 等), 整个 logical block operation 视为失败:
+
+| 场景 | 行为 | 结果 |
+|------|------|------|
+| A. KV Store ok / Scale Store fail | `pack_scale` 抛异常 → `store` 整体抛异常 | ✅ CPU block 不 READY |
+| B. KV Load ok / Scale unpack fail | `unpack_scale` 抛异常 → `load` 整体抛异常 | ✅ dst scale 未写入 (仍 0) |
+| C. KV unpack ok / Scale unpack fail | `unpack_scale` 抛异常 → `load` 整体抛异常 | ✅ KV 已写 / Scale 未写 → 不一致, 上层禁用 |
+
+**不存在 KV READY + Scale 错误 / Scale READY + KV 错误**: 本阶段独立 PoC 直接报错并禁止上层使用。store/load 任一步失败即抛异常, 调用方不得使用该 logical block。
+
+## 19. 当前瓶颈
+
+| ctx_len | blocks | kv_staging_MB | scale_staging_MB | compact_logical_MB | compact_peak_MB | peak_GB |
+|---------|--------|---------------|------------------|---------------------|-----------------|---------|
+| 1024 | 64 | 630.0 | 19.69 | 4.0 | 11.35 | 1.815 |
+| 2048 | 128 | 630.0 | 19.69 | 8.0 | 18.38 | 1.834 |
+| 4096 | 256 | 630.0 | 19.69 | 16.0 | 36.13 | 1.873 |
+| 8192 | 512 | 630.0 | 19.69 | 32.0 | 72.25 | 1.951 |
+
+- **staging 常驻**: KV 630MB + Scale 19.69MB = 649.69MB (max 560 blocks, 预分配)。
+- **compact BF16 真实峰值** (§十七/§二十要求重新核实): 用 `max_memory_allocated` 减去 baseline (零 compact 的 flash_attention) 测得, 8192 时 **72.25MB**, 远小于逻辑累计 32MB × 36 层。说明 compact BF16 是逐层 dequant、用完即释放, **真实同时存活峰值 ≈ 单层 compact 的 ~2.2x** (k_compact + v_compact + flash 中间量), 不是全层逻辑累计量。
+
+## 17. Temporary BF16 Memory Recheck (§十七)
+
+**结论: compact BF16 真实同时存活峰值 = compact_peak_MB, 不是 36 层逻辑累计量。**
+
+- 逻辑累计 (36 层 × 2(k+v) × n × H × T × D × 2): 8192 时 32MB × 36 = 1152MB —— 这是错误的算法。
+- 真实峰值 (peak counter): 8192 时 72.25MB。逐层 dequant, 每层 `k_compact`/`v_compact` 在该层 flash_attention 后即无引用, MLU allocator 回收。峰值 = 单层 (k+v) compact + flash 中间 buffer, 约 2.2x 单层 compact。
+- **8192 的 72.25MB 是同一时刻真实峰值, 可接受** (远小于 staging 649.69MB 常驻)。
+
+## 18. Failure Handling (§九)
+
+错误注入测试 (KV ok / Scale fail 等), 整个 logical block operation 视为失败:
+
+| 场景 | 行为 | 结果 |
+|------|------|------|
+| A. KV Store ok / Scale Store fail | `pack_scale` 抛异常 → `store` 整体抛异常 | ✅ CPU block 不 READY |
+| B. KV Load ok / Scale unpack fail | `unpack_scale` 抛异常 → `load` 整体抛异常 | ✅ dst scale 未写入 (仍 0) |
+| C. KV unpack ok / Scale unpack fail | `unpack_scale` 抛异常 → `load` 整体抛异常 | ✅ KV 已写 / Scale 未写 → 不一致, 上层禁用 |
+
+**不存在 KV READY + Scale 错误 / Scale READY + KV 错误**: 本阶段独立 PoC 直接报错并禁止上层使用。store/load 任一步失败即抛异常, 调用方不得使用该 logical block。
+
+## 19. 当前瓶颈
+
+1. **Prefix HIT dequant 13.4ms 是硬下限**: `flash_attention` 不支持 int8, prefix-cache prefill 必须先 MLU 反量化成 compact bf16。这 13.4ms 不随 prefix 长度显著变化 (只反量化 used blocks), 但占据 INT8 L2 TTFT 的 ~30%, 抵消了大部分 Load 收益。
+2. **Load 主导项是 `h2d_kv` + `unpack_kv`**: 4096 时 h2d_kv 11.9ms (随规模线性) + unpack_kv 3.7ms (scatter), scale 的 h2d+unpack 仅 0.6ms, 可忽略。
+3. **双 DMA 无显著 launch overhead**: 见 §19/§12 分析, KV+Scale 分开两次 DMA 反而比 packed byte-buffer 略快 (少一次 device pack/unpack 到 byte buffer), 保留双 Pool 双 DMA。
+4. **Decode-only 场景无 dequant 瓶颈**: resume/decode 直接用 `single_query_cached_kv_attn` 读 int8+scale (算子内部反量化), 不走 compact bf16 dequant, Load 16.3ms (4096) 是纯收益, first_decode 0.117ms 不退化。
+
+## 20. 是否值得正式接入 Hierarchical Cache
+
+**分别回答 (§二十)**:
+
+| 维度 | 结论 | 证据 |
+|------|------|------|
+| A. Capacity | **≈1.94x** ✅ | 1.9385~1.9396x, 与理论一致 |
+| B. Host-device Traffic | **下降 ~48%** ✅ | 576→297MB (4096), 48.4% |
+| C. Load latency | **显著下降** ✅ | 4096: 31.2→16.3ms (1.91x), <17ms "很好" |
+| D. Decode Restore | **无额外误差** ✅ | max_abs=0, 逐层 exact 36/36 |
+| E. Prefix HIT | Load 收益被 dequant 抵消约 13ms | dequant 13.4ms 硬下限, 净 TTFT 收益 ~load 差额的 1/3 |
+| F. Peak Memory | staging 649.69MB + compact peak 72.25MB (8192), 可接受 | compact 是真实峰值非逻辑累计 |
+
+**Quantized L2 主要价值 = 容量 + Host-device 带宽**, 不是 TTFT 再翻倍。这与任务 §二十的预判一致。
+
+---
+
+## 最终 14 个问题回答
+
+1. **CPU L2 能否直接保存 INT8 KV+FP32 scale, 不做 BF16 dequant?**
+   ✅ 能。`CPUKVPoolV3Quantized` 直接存 native INT8 KV + FP32 Scale, 全程无 dequant/requant, bit-exact。
+
+2. **Quantized logical block 的 KV/Scale shape 和 bytes 分别多少?**
+   KV `(2,36,8,16,128)` int8 = 1,179,648 bytes (1.125 MiB); Scale `(2,36,8,16)` fp32 = 36,864 bytes (0.0352 MiB); 合计 1,216,512 bytes (1.1602 MiB)。
+
+3. **CPU L2 capacity 相对 BF16 提升多少?**
+   **1.9394x** (1.9385~1.9396x 实测, 与理论一致)。
+   4. **4096 Prefix Host→MLU bytes 从多少降到多少?**
+   576MB → 297MB (INT8 KV 288MB + Scale 9MB)。
+
+5. **Store latency BF16 vs INT8 分别多少?**
+   4096: BF16 19.3ms / INT8+Scale 10.2ms (1.88x)。
+
+6. **Load latency BF16 vs INT8 分别多少?**
+   4096: BF16 31.2ms / INT8+Scale 16.3ms (1.91x)。
+
+7. **KV 和 Scale arbitrary remap 是否都 bit-exact?**
+   ✅ 都 bit-exact。376 项全 PASS, KV (int8) + Scale (fp32) 在 4 种映射类型 × 6 规模 × 多 pack/unpack 方法下 `torch.equal=True`。
+
+8. **CPU Restore 后 Decode 输出是否与原 INT8 MLU 路径一致?**
+   ✅ exact 一致 (max_abs=0, 逐层 36/36)。CPU Offload 无额外量化误差。
+
+9. **CPU Restore 后 Prefix HIT 是否与原 INT8 Prefix HIT 一致?**
+   ✅ exact 一致 (max_abs=0, 逐层 36/36)。
+
+10. **1024/2048/4096/8192 Prefix 下 INT8 L2 Load+dequant 真实 TTFT 如何?**
+    35.6 / 38.7 / 45.5 / 62.8ms。dequant 13.4~15.2ms 是硬下限, 占 TTFT ~30%。
+
+11. **Prefix HIT compact BF16 真实同时存活 peak memory 是多少?**
+    8192 时 72.25MB (真实 peak counter), 非 36 层逻辑累计 (1152MB)。逐层用完即释放。
+
+12. **KV+Scale 双 DMA 是否有明显 launch overhead?**
+    ❌ 无。dual DMA 反而比 packed byte-buffer 略快 (4096 D2H: 10.25 vs 10.58ms, H2D: 16.27 vs 16.53ms), 因 packed 多一次 device pack/unpack 到 byte buffer。保留双 Pool 双 DMA。
+
+13. **Quantized L2 主要价值是 TTFT、容量、带宽还是三者兼有?**
+    **容量 + 带宽为主**, TTFT 为辅。容量 1.94x, 流量 -48%, Load 1.91x; 但 Prefix HIT TTFT 受 dequant 13.4ms 硬下限限制, 净 TTFT 收益约 load 差额的 1/3。Decode-only (resume) 场景 Load 是纯收益。
+
+14. **是否值得正式接入现有 Admission/LRU/Async Store/Async Load/Scheduler?**
+    ✅ 值得, 但**主要价值定义为"容量 + 带宽"**。Correctness 全 PASS (KV+Scale bit-exact, Decode/Prefix HIT 无额外误差), 容量 1.94x, 流量 -48%, Load 1.91x。Prefix HIT TTFT 受 dequant 限制, 不应期待 TTFT 接近 2x。
+    ## 最终裁决
+
+### **B. PASS WITH LIMITATION**
+
+**理由**:
+- ✅ **Correctness 全 PASS**: KV+Scale bit-exact (376 项), Decode Restore max_abs=0 (逐层 36/36), Prefix HIT Restore max_abs=0, 错误注入 3 场景全 PASS, KV/Scale Ownership Invariant 成立。
+- ✅ **容量 ≈1.94x**: 1.9385~1.9396x, 与理论 1.9394x 一致。
+- ✅ **流量下降 ~48%**: 576→297MB (4096)。
+- ✅ **Load 明显优于 BF16**: 4096 31.2→16.3ms (1.91x), 达 <17ms "很好" 标准。
+- ✅ **Peak Memory 可接受**: staging 649.69MB 常驻 + compact peak 72.25MB (8192, 真实峰值非逻辑累计)。
+- ✅ **双 DMA 无 launch overhead**: 保留双 Pool 双 DMA。
+- ⚠️ **LIMITATION**: Prefix HIT dequant 13.4ms 是硬下限 (`flash_attention` 不支持 int8), 抵消部分 TTFT 收益。Quantized L2 的主要价值是 **容量 + 带宽**, 不是 TTFT 再翻倍。
+
+**仍值得接入**, 但接入时应将主要价值定位为"容量 + 带宽", TTFT 改善为附带收益 (Decode-only/resume 场景是纯 Load 收益)。
+
+---
+
+## 停止条件达成情况
+
+- [x] Quantized CPU block layout 完成 (KV `(B,2,L,H,T,D)` int8 + Scale `(B,2,L,H,T)` fp32)
+- [x] KV/Scale 共用一个 allocator/block id (单一 allocator, 结构杜绝错配)
+- [x] KV block contiguous / Scale block contiguous (36 + 36 项 PASS)
+- [x] Store correctness PASS (376 项)
+- [x] Load correctness PASS (376 项)
+- [x] KV bit-exact / Scale bit-exact (torch.equal)
+- [x] arbitrary remap PASS (4 类型 × 6 规模 × 多方法)
+- [x] BF16 vs INT8 capacity 完成 (1.9394x)
+- [x] BF16 vs INT8 Store/Load benchmark 完成 (1.88x/1.91x)
+- [x] Decode Restore correctness 完成 (max_abs=0)
+- [x] Prefix HIT Restore correctness 完成 (max_abs=0)
+- [x] 4096 实际 Load 数据完成 (16.3ms, 297MB)
+- [x] Peak MLU memory 重新核实 (compact peak 72.25MB, 真实峰值)
+- [x] 不修改现有 Async/LRU/Scheduler 主流程 (独立 PoC, 未触碰)
+**未实现 (按 §二十一/§二十六禁止)**: Quantized Async Store/Load, Scheduler 正式切换, LRU 正式切换, Active KV Offload, INT4, ARC, SSD L3。
+
+## 交付物
+
+| 文件 | 说明 |
+|------|------|
+| `cpu_kv_pool_v3_quantized.py` | CPUKVPoolV3Quantized (INT8 KV + FP32 Scale, 单一 allocator) |
+| `quantized_kv_block_mover.py` | QuantizedKVBlockMover (同步 Store/Load, device pack/unpack) |
+| `test_quantized_pool.py` | 池正确性 (36 PASS) |
+| `test_quantized_store_load.py` | Store/Load + remap + 错误注入 (376 PASS) |
+| `test_quantized_decode_restore.py` | Decode Restore (14 PASS, max_abs=0) |
+| `test_quantized_prefix_hit.py` | Prefix HIT Restore + TTFT/Decode 拆分 (9 PASS) |
+| `benchmark_quantized_l2.py` | 容量/Store-Load/峰值/双DMA benchmark |
+| `results/*.csv` | 6 个 CSV (capacity/store_load/decode/prefix_hit/peak_memory/dual_dma) |
+| `results/quantized_l2_report.md` | 本报告 |
+

@@ -1,0 +1,377 @@
+# Quantized L2 正式接入报告 (INT8 KV + FP32 Scale)
+
+> **阶段**: Quantized L2 正式系统接入 (§三十: 本阶段只交付此件, 不延伸)。
+> **目标架构**: MLU L1 = INT8 KV + FP32 Scale; CPU L2 = INT8 KV + FP32 Scale (Block-Major, Admission + LRU);
+> Async Store/Load 把 KV+Scale 作为一个原子逻辑块搬运 (单 Event, 同一 transfer_stream)。
+> **对照基准**: BF16 V2 路径保留 (`cpu_prefix_cache_dtype="bf16"`), 用于 A/B 对比。
+>
+> 代码引用格式: `file:line`。所有量化测试/基准在 `kv_offload_integration/quantized_hierarchical/`。
+
+---
+
+## §一 范围与交付物
+
+**交付 (§三十)**:
+1. Quantized L2 正式接入代码 (config / mover async 三方法 / backend bundle / LLMEngine 装配 / metrics)。
+2. 测试: 6 个量化测试文件, 共 **373/373 PASS**。
+3. benchmark CSV: `results/quantized_hierarchical_benchmark.csv` + `results/bf16_vs_quantized_comparison.csv`。
+4. 本报告 `quantized_hierarchical_report.md`。
+
+**严格不做 (§一, verbatim)**: Pending Load Coalescing 扩展 / Adaptive Sync-Async 扩展 /
+Active KV Offload / ARC / SSD L3 / INT4 FP8 / Attention Kernel / torch_mlu_ops /
+speculative decoding / 大范围 Scheduler 重写 / Prefix Hash-LRU 重写 / CNRT C++。
+本阶段只做: **Quantized L2 正式系统接入**。
+
+---
+
+## §二 接入前分析 (先于代码)
+
+见 `analysis_report.md` (本目录, 未改任何代码完成)。核心结论:
+- 线 A (BF16 主链路) 全链路假设"只有一个 KV tensor"; 接入点 = backend `__init__` /
+  staging pool / async 三方法 / LLMEngine 装配 / metrics。
+- `QuantizedKVBlockMover.store()/load()` 已把 KV+Scale 作原子逻辑块搬运, 同步路径只需换 mover。
+- 缺的是 async 三方法: `pack_to_staging` / `submit_d2h` / `submit_load_async` (PoC 只有同步版)。
+- `CPUPrefixIndex` / `BlockManager` / `Scheduler` 主流程 dtype-agnostic, **不动**。
+- `CPUKVPoolV3Quantized` 单一 allocator: KV+Scale 共用同一 `cpu_block_id`, free 一个即同时释放两者。
+
+---
+## §三 原子逻辑块设计 (KV+Scale = 一个 cpu_block_id)
+
+- **一个逻辑 cpu_block_id = `cpu_kv[id]` + `cpu_scale[id]`** (§三/§十八)。
+- `PrefixIndex` 仍是 `hash -> cpu_block_id` (NOT `hash -> (kv_id, scale_id)`)。
+- Admission / LRU / duplicate / refcount 全部基于逻辑 `cpu_block_id`。
+- `CPUKVPoolV3Quantized.allocate/free` 单一 allocator: 分配/释放同时作用于 KV+Scale (`cpu_kv_pool_v3_quantized.py:140-168`)。
+- 验证 (`test_quantized_stress.py` `test_logical_ownership`): store 4 块 → cpu_ids=[0,1,2,3];
+  KV block view 与 Scale block view 同 id 都非零; remove cpu0 后 used=3; 复用 cpu0 存新 prefix,
+  KV+Scale block0 都被覆盖 (block-major permute 后 bit-exact)。**49/49 PASS**。
+
+---
+
+## §四 Backend 装配 (双资源显式注入)
+
+`PrefixCacheBackend(mlu_kv, ..., mlu_scale=..., cache_dtype="int8")` (`prefix_cache_backend.py:410-453`):
+- `cache_dtype="int8"` → `quantized=True`; int8 模式 `mlu_scale` 必须非 None (否则 ValueError)。
+- int8: `CPUKVPoolV3Quantized` + `QuantizedKVBlockMover(mlu_kv, mlu_scale, cpu_pool, ...)`。
+- bf16: 原 `CPUKVPoolV2` + `KVBlockMoverV2` (不动, A/B 对照)。
+- **Mover 持有 ModelRunner 同一全局 `kv_cache` + `kv_scales`** (§八: 不在 backend 内重新遍历 module 推导 scale)。
+- 验证 (`test_quantized_scheduler.py`): `be.mover.mlu_scales is llm.model_runner.kv_scales` → True;
+  `mlu_kv.dtype==int8`, `mlu_scales.dtype==float32`。**44/44 PASS**。
+
+---
+
+## §五 Async Store (KV+Scale 双资源, 单 Event)
+`submit_store` (`prefix_cache_backend.py` submit_store) → `mover.pack_to_staging` (KV pack + Scale pack)
+→ `mover.submit_d2h` (KV D2H + Scale D2H, 同一 transfer_stream) → **单 `Event.record()` 末尾** → `STORE_PENDING`。
+Commit READY 仅当 KV D2H **且** Scale D2H 都完成 (单 Event 覆盖两者, §十二)。
+submit 返回后 source MLU block 可安全 deallocate (pack 已完成, D2H 只依赖 staging)。
+
+**基准 (§十八, KV+Scale bit-exact)**:
+| prefix | blocks | sync_store | async_visible | pack | d2h | speedup |
+|--------|--------|-----------|--------------|------|-----|---------|
+| 1024 | 64 | 3.67ms | 1.59ms | 1.38ms | 0.06ms | 2.31x |
+| 2048 | 128 | 6.54ms | 2.23ms | 1.98ms | 0.08ms | 2.93x |
+| 4096 | 256 | 11.22ms | 2.42ms | 2.11ms | 0.14ms | 4.64x |
+
+4096 async visible **2.42ms < 5ms** (目标 <5ms, best 2-4ms ✓), sync 11.22ms (目标 ~10ms ✓)。
+**78/78 PASS** (`test_quantized_async_store.py`)。
+
+---
+
+## §六 Async Load (KV+Scale 双资源, 单 Event)
+
+`submit_load` → `mover.submit_load_async` (cpu_kv + cpu_scale → async H2D KV + H2D Scale →
+unpack KV + unpack Scale) → **`Event.record()` 在 Scale unpack 之后** (§十四) → `LOAD_PENDING`。
+Commit 仅当 native MLU `kv_cache` + `kv_scales` 都 ready (单 Event 覆盖两者)。
+CPU refcount 在逻辑 `cpu_block_id` 上 (V3 单 allocator, 无需单独 Scale refcount)。
+
+**基准 (§十九, KV+Scale bit-exact)**:
+| prefix | blocks | sync_load | async_submit | async_wait |
+|--------|--------|-----------|--------------|------------|
+| 1024 | 64 | 2.92ms | 349.3µs | 2.63ms |
+| 2048 | 128 | 5.69ms | 441.5µs | 5.37ms |
+| 4096 | 256 | 11.22ms | 615.9µs | 10.85ms |
+
+4096 sync load **11.22ms** (目标 ~16ms, 实测更快, 量化后流量减半), async submit **615.9µs** (非阻塞)。
+**94/94 PASS** (`test_quantized_async_load.py`)。
+
+---
+
+## §七 Staging Bundle (kv_staging + scale_staging)
+
+Store/Load staging slot = `{"state", "owner_job_id", "kv_staging", "scale_staging"}` (§十)。
+一个 job 同时独占二者 (bundle), 不能分别分配; `acquire/release` 按 slot_id 原子操作。
+BF16 模式 `scale_staging=None` (不分配, 省 MLU 显存)。
+验证 (`test_quantized_async_store.py` `test_staging_ownership`): max_pending=2, A/B pending 两 slot BUSY,
+C skip `staging_busy`, A 完成后 C 成功; 每 BUSY slot 有 scale_staging。**78/78 PASS**。
+
+---
+
+## §八 Reserve/Commit 分离 (LOAD_PENDING)
+
+Reserve: `block_manager.allocate_prefix(set_cached_tokens=False)` 只 reserve MLU target 块
+(写 block_table), 不设 `num_cached_tokens`, 不注册 hash (§五)。
+Commit: `complete_cpu_prefix_load` (commit hash + `num_cached_tokens`) 仅在 Event complete 后。
+LOAD_PENDING 期间 target MLU 块不可复用, seq 不 forward (§二十三)。
+验证 (`test_quantized_async_load.py`): refcount 保护 in-flight CPU 块不被 LRU 淘汰;
+并发共享 load (同 prefix) refcount 正确。**94/94 PASS**。
+
+---
+
+## §九 失败原子性 (§十三, 6 类注入)
+
+| 注入 | 结果 | rollback |
+|------|------|----------|
+| A. KV pack ok / Scale pack fail | `store_io_failure` | CPU block free, staging FREE, hash 未 commit |
+| B. KV D2H ok / Scale D2H fail | `store_io_failure` | 同上 |
+| C. Event query 异常 | `_fail_job` | 同上, 未 commit |
+| D. KV H2D ok / Scale H2D fail | `load_io_failure` | refs 由调用方释放, slot FREE |
+| E. KV unpack ok / Scale unpack fail | `load_io_failure` | 同上 |
+| F. Event query 异常 | `LOAD_FAILED` | refs 释放, slot FREE |
+
+半写不可见: store 失败后复用 CPU block 数据正确 (bit-exact); load 失败后 target block 不可 commit,
+后续正常 load 写入正确 (bit-exact)。**56/56 PASS** (`test_quantized_failure.py`)。
+
+---
+
+## §十 Config 开关 (BF16/INT8 可比)
+
+`nanovllm/config.py:30`: `cpu_prefix_cache_dtype: str = "bf16"` (§十四)。
+- `"bf16"`: 原 V2 路径 (CPUKVPoolV2 + KVBlockMoverV2 + 单 staging), **未删, 用于 A/B 对比**。
+- `"int8"`: `apply_kvcache_quant_patch()` (LLM 构造前注入) + `mlu_scale=kv_scales` + `cache_dtype="int8"`。
+`llm_engine.py:39-42`: 仅当 `cpu_prefix_offload=True` 且 `cpu_prefix_cache_dtype=="int8"` 时 patch。
+
+---
+
+## §十一 真实 Quantized CPU Prefix HIT (§十五/十六/十七)
+
+`test_quantized_scheduler.py` 直接驱动 `LLMEngine.step()` (真实请求链路, 不 mock, `cpu_prefix_cache_dtype="int8"`):
+- **Case A Cold Miss**: MLU+CPU MISS, 全量 prefill, `last_cpu_hit` falsy。
+- **Case B L1 HIT**: MLU 命中, CPU 不承担主路径, `last_cpu_hit` falsy。
+- **Case C CPU L2 HIT (核心)**: MLU MISS + CPU HIT, Sync Load INT8+Scale, `last_cpu_hit` 非空,
+  suffix prefill, 输出 token 正确。
+- **Case D CPU MISS**: 不同 prefix, `last_cpu_hit` falsy。
+- **SYNC 路径优先验证 (§十五)**: Async off, 真实 Cold → Store Quantized CPU L2 → reset L1 →
+  CPU L2 HIT → Sync Load INT8+Scale → commit → suffix prefill/decode。输出 token 正确, KV+Scale 正确。
+  **Sync 真实 CPU HIT 先于 Async 通过** (§十五要求)。
+- **正确性语义**: Cold 用 fresh bf16 K/V (block_tables=None, 不读 cache); L1 HIT / CPU L2 HIT 都 dequant 自 int8 cache。
+  故 L1-HIT-vs-CPU-L2-HIT bit-exact (同 dequant 同 int8+scale); Cold-vs-CPU-HIT 非 bit-exact (量化误差 ~0.66% 翻转 greedy argmax)。
+  正确性比对 = L1-vs-CPU, 非 Cold-vs-CPU。
+**44/44 PASS**。
+## §十二 Admission + LRU (量化逻辑块, §十八)
+
+`test_quantized_lru.py`: Admission (min_tokens / prompt_only / too_large)、LRU eviction
+(只淘汰 READY, STORE_PENDING 不可淘汰, ref>0 不可淘汰)、refcount、duplicate、metrics。
+CPU free+ready+pending==capacity 恒成立。**52/52 PASS**。
+
+---
+
+## §十三 Compute/Transfer Overlap (BF16 vs Quantized, §二十)
+
+真实 LLM prefill (512 token) 作 compute workload, async D2H Store 在 transfer_stream, compute 在默认流, 硬件重叠。
+`overlap_eff = (T_store_alone + T_compute_alone - T_overlap_wall) / min(...)`。
+
+| 模式 | T_store_alone | T_compute_alone | T_overlap_wall | overlap_eff |
+|------|--------------|----------------|----------------|-------------|
+| BF16 | 19.85ms | 78.68ms | 81.60ms | **0.853** |
+| INT8 | 11.26ms | 80.17ms | 82.84ms | **0.763** |
+
+- 量化 D2H (11.26ms) 比 BF16 (19.85ms) 快 **43%** (流量减半, KV int8 + Scale fp32)。
+- compute loop 内不调 device-wide `torch.mlu.synchronize()` (否则串行化 D2H 与 compute, eff≈0)。
+- 两 LLM 各占 ~50GB 显存, 同进程无法并存 (BF16 del 后 MLU allocator reserved segments ~55GB 不归还 OS,
+  `mem_get_info` 的 used 仍含之, 第二个 LLM `num_kvcache_blocks` 公式恒 ≤0)。
+  故 BF16 与 Quantized overlap 在**独立子进程**跑, 各自独占干净显存。
+  overlap_eff 与 KV cache 大小无关 (store 只用末尾 256 块, compute 固定 512-token prefill), 可比。
+
+---
+## §十四 Staging Memory 节省 (§二十一)
+
+同 num_cpu_blocks (256+8) + 同 max_pending/max_blocks 配置:
+| 模式 | cpu_kv | cpu_scale | staging 总 | cap_ratio |
+|------|--------|-----------|-----------|----------|
+| BF16 | 594.00MiB | 0 | 2592.00MiB | 1.0 |
+| INT8 | 297.00MiB | 9.28MiB | 1355.06MiB | 1.9394 |
+
+- **staging 节省 47.72%** (2592 → 1355 MiB)。
+- **CPU 容量比 1.9394x** (同预算下 INT8 可存近 2x prefix)。
+
+---
+
+## §十五 Quantized Metrics (§二十二)
+
+`CacheMetrics` 新增 (保留原有): `cpu_quantized_mode`, `cpu_kv_bytes`, `cpu_scale_bytes`,
+`store_kv_bytes`, `store_scale_bytes`, `load_kv_bytes`, `load_scale_bytes`,
+`quantized_traffic_saved_bytes`, `quantized_cpu_capacity_ratio`, `quantized_staging_memory_mb`。
+BF16 模式 `cpu_scale_bytes=0`, `quantized_cpu_capacity_ratio=1.0` (不引入额外开销)。
+INT8 模式累计 KV+Scale D2H/H2D 字节, `quantized_traffic_saved_bytes` 记录相对 BF16 节省。
+见 `results/bf16_vs_quantized_comparison.csv`。
+
+---
+
+## §十六 流量节省 (§二十五)
+
+4096 tokens (256 blocks):
+- BF16 store 流量: 256 × 2.25MiB = **576 MiB** (603979776 bytes)。
+- INT8 store 流量: KV 288MiB + Scale 9MiB = **297 MiB** (311427072 bytes)。
+- **流量节省 48.44%** (traffic_ratio q/bf = 0.5156)。
+- 与 PoC 预期 (576→297MB, -48.4%) 一致。
+
+---
+## §十七 长时间压力 (§二十三)
+
+混合 Async Store + Async Load + Admission + LRU + refcount, invariant 持续成立 + 终态 + 抽样 bit-exact:
+| cap | ops | store_sub | store_fail | load_sub | load_fail | peak_ref | bitexact | inv_viol |
+|-----|-----|-----------|-----------|----------|-----------|----------|----------|----------|
+| 64 | 500 | 16 | 0 | 141 | 0 | 3 | 8/8 | 0 |
+| 128 | 1000 | 32 | 0 | 311 | 0 | 3 | 8/8 | 0 |
+| 256 | 5000 | 64 | 0 | 1583 | 0 | 3 | 8/8 | 0 |
+
+终态: pending_store=0, pending_load=0, all refs=0, all staging FREE, 随机 load KV+Scale bit-exact。
+**49/49 PASS** (`test_quantized_stress.py`) + benchmark stress 全 `ok`。
+
+---
+
+## §十八 原有回归 (BF16 路径保留, §二十四)
+
+| 测试 | 结果 |
+|------|------|
+| `test_cpu_prefix_scheduler.py` | 31/31 PASS |
+| `test_cpu_lru_admission.py` | 104/104 PASS |
+| `test_async_store.py` | 102 passed, 1 failed (已知非阻塞: §35 LLM "A vs B 输出 exact match", 量化无关, pre-existing) |
+| `test_async_load.py` | 102/102 PASS |
+
+BF16 V2 路径未删, A/B 对比可用。1 个 pre-existing 失败 (BF16 LLM greedy 输出在 A/B 间发散, 非量化引入, 非阻塞)。
+
+---
+
+## §十九 量化测试汇总
+
+| 测试文件 | PASS/Total | 覆盖 |
+
+|----------|-----------|------|
+| `test_quantized_scheduler.py` | 44/44 | 真实 Scheduler 闭环, SYNC CPU HIT (§十五) |
+| `test_quantized_lru.py` | 52/52 | Admission+LRU+Eviction+Metrics (§十八) |
+| `test_quantized_async_store.py` | 78/78 | Async Store + STORE_PENDING + Event (§五) |
+| `test_quantized_async_load.py` | 94/94 | Async Load + LOAD_PENDING + refcount (§六) |
+| `test_quantized_failure.py` | 56/56 | 6 类失败原子性 + 半写不可见 (§十三) |
+| `test_quantized_stress.py` | 49/49 | 长时间压力 + 不变量 + 终态 + bit-exact (§二十三) |
+| **合计** | **373/373** | |
+
+---
+
+## §二十 跨流同步纪律 (本会话关键发现)
+
+per-block 写 (`kv[:, :, sid, :, :, :] = ...`) 在 **default MLU stream**; `store_blocks`/`submit_store`/
+`submit_load` 的 pack 在 `mover.transfer_stream` (`with torch.mlu.stream(transfer_stream)`)。
+二者**无隐式同步**, pack 可能读 stale/partial init 数据 → bit-exact 偶发失败
+(尤其跨多个 backend/复用 MLU tensor 时)。
+**FIX**: 所有 per-block init 写之后, 调 store/submit 前, **显式 `torch.mlu.synchronize()`**。
+这不是 mover 的 bug (V2 BF16 mover 同结构), 而是 test/benchmark harness 纪律。
+已在所有量化测试 + benchmark 的 init 循环后加 `torch.mlu.synchronize()`。
+
+---
+
+## §二十一 输出文件 (§二十六)
+
+```
+kv_offload_integration/quantized_hierarchical/
+├── analysis_report.md                      # §二 接入前分析 (先于代码)
+├── test_quantized_scheduler.py              # 44 PASS
+├── test_quantized_lru.py                    # 52 PASS
+├── test_quantized_async_store.py            # 78 PASS
+├── test_quantized_async_load.py             # 94 PASS
+├── test_quantized_failure.py                # 56 PASS
+├── test_quantized_stress.py                 # 49 PASS
+├── benchmark_quantized_hierarchical.py      # benchmark
+└── results/
+    ├── quantized_hierarchical_benchmark.csv # 主基准 (store/load/overlap/stress)
+    ├── bf16_vs_quantized_comparison.csv     # BF16 vs INT8 metrics 对比
+    └── quantized_hierarchical_report.md      # 本报告
+```
+
+---
+
+## §二十二 结论
+
+Quantized L2 (INT8 KV + FP32 Scale) 已正式接入 Hierarchical Prefix Cache 主链路:
+- KV+Scale 原子逻辑块 (单 cpu_block_id, 单 Event, 同 transfer_stream) 全链路一致。
+- Sync 真实 CPU HIT 先于 Async 通过 (§十五); 6 类失败原子性 + 半写不可见 (§十三)。
+- 容量 1.9394x, 流量 -48.44%, staging -47.72%, 4096 async store visible 2.42ms, async load submit 615.9µs。
+- BF16 V2 路径保留, A/B 对比可用; 373/373 量化测试 + BF16 回归全 PASS (1 pre-existing 非阻塞)。
+- 严格未越界 (§一/§三十): 未做 Coalescing 扩展 / Adaptive 扩展 / Active Offload / ARC / SSD / INT4 / CNRT C++。
+
+---
+
+# §二十八 14 个问题
+
+**Q1. KV 与 Scale 是否作为单一原子逻辑块 (一个 cpu_block_id)?**
+是。`CPUKVPoolV3Quantized` 单一 allocator, `cpu_kv[id]`+`cpu_scale[id]` 共用 id; allocate/free 同时作用于两者;
+PrefixIndex 仍 `hash->cpu_block_id`; Admission/LRU/refcount 全基于逻辑 id。验证: `test_logical_ownership` PASS。
+
+**Q2. Backend 是否显式接收 mlu_kv 和 mlu_scale (不在 backend 内推导 scale)?**
+是。`PrefixCacheBackend(mlu_kv, ..., mlu_scale=..., cache_dtype="int8")`; Mover 持有 ModelRunner 同一全局
+`kv_cache`+`kv_scales` (`be.mover.mlu_scales is llm.model_runner.kv_scales` → True)。
+
+**Q3. Async Store 是否 KV+Scale 双 D2H + 单 Event, commit 仅当两者都完成?**
+是。同 transfer_stream 顺序 KV D2H + Scale D2H, 末尾单 `Event.record()`; flush 等 1 Event = 两者都完成。
+submit 返回后 source MLU block 可 deallocate (pack 已完成)。
+
+**Q4. Async Load 是否 KV+Scale 双 H2D + 双 unpack, Event 在 Scale unpack 之后?**
+是。同 transfer_stream H2D KV + H2D Scale → unpack KV + unpack Scale → `Event.record()` 在 Scale unpack 后;
+commit 仅当 native `kv_cache`+`kv_scales` 都 ready。
+
+**Q5. Staging 是否 bundle (kv_staging+scale_staging), 一个 job 独占两者?**
+是。slot=`{state, owner_job_id, kv_staging, scale_staging}`; acquire/release 按 slot_id 原子; BF16 scale_staging=None。
+
+**Q6. STORE_PENDING 是否不可 lookup/不可淘汰, READY 仅当 KV+Scale 都完成?**
+是。pending hash 不进 ready index (lookup MISS); LRU 只淘汰 READY ref==0; commit READY 仅当 Event complete (两者都完成)。
+
+**Q7. CPU refcount 是否只在逻辑 cpu_block_id (无单独 Scale refcount)?**
+是。V3 单 allocator, refcount 在 `CPUPrefixIndex` 的逻辑 id 上; in-flight CPU 块 (ref>0) 不被 LRU 淘汰。
+
+**Q8. Reserve/Commit 是否分离 (reserve target 不设 num_cached_tokens, commit 仅 Event 后)?**
+是。`allocate_prefix(set_cached_tokens=False)` 只 reserve; `complete_cpu_prefix_load` commit hash+num_cached_tokens 仅 Event complete 后。
+
+**Q9. 失败是否完整 rollback (无 commit, CPU free, staging FREE, hash 清, 半写不可见)?**
+是。6 类注入 (A-F) 全 rollback; store fail → CPU free + staging FREE + hash 未 commit; load fail → refs 释放 + slot FREE + target 不 commit;
+半写后复用 CPU block / 后续 load 数据 bit-exact。56/56 PASS。
+
+**Q10. BF16 V2 路径是否保留 (未删, 可 A/B 对比)?**
+是。`cache_dtype="bf16"` 走原 CPUKVPoolV2+KVBlockMoverV2+单 staging, 不分配 scale_staging; BF16 回归全 PASS (1 pre-existing 非阻塞)。
+
+**Q11. Sync 真实 CPU HIT 是否先于 Async 通过 (§十五)?**
+是。`test_quantized_scheduler.py` Case C: Async off, 真实 Cold→Store→reset L1→CPU HIT→Sync Load INT8+Scale→commit→suffix, 输出正确。
+
+**Q12. 量化指标是否齐全 (§二十二)?**
+是。cpu_quantized_mode/cpu_kv_bytes/cpu_scale_bytes/store_kv_bytes/store_scale_bytes/load_kv_bytes/load_scale_bytes/
+quantized_traffic_saved_bytes/quantized_cpu_capacity_ratio/quantized_staging_memory_mb 全实现, BF16 不引入额外开销。
+
+**Q13. 容量/流量/staging 收益是否符合预期?**
+是。容量 1.9394x (vs PoC 1.9394x), 流量 -48.44% (vs PoC -48.4%), staging -47.72%; 4096 async store visible 2.42ms (<5ms)。
+
+**Q14. 是否严格未越界 (§一/§三十)?**
+是。未做 Coalescing 扩展 / Adaptive 扩展 / Active Offload / ARC / SSD L3 / INT4 FP8 / Attention Kernel / torch_mlu_ops /
+speculative decoding / Scheduler 重写 / Prefix Hash-LRU 重写 / CNRT C++。只交付: 接入代码 + 测试 + benchmark CSV + 本报告。
+
+---
+
+# §二十九 裁决
+
+## **裁决: A. PASS**
+
+**理由**:
+1. **正确性**: 373/373 量化测试 PASS; KV+Scale bit-exact 全链路 (sync store/load, async store/load, stress 抽样, 失败后半写不可见)。
+2. **原子性**: KV+Scale 单 cpu_block_id + 单 Event + 同 transfer_stream; 6 类失败完整 rollback + 半写不可见。
+3. **真实链路**: 真实 LLMEngine.step() 闭环 (不 mock), Sync CPU HIT 先于 Async 通过 (§十五)。
+4. **收益达标**: 容量 1.9394x, 流量 -48.44%, staging -47.72%, 4096 async store visible 2.42ms (<5ms), async load submit 615.9µs。
+5. **BF16 保留**: V2 路径未删, A/B 对比可用, BF16 回归全 PASS (1 pre-existing 非阻塞)。
+6. **未越界**: 严格限于 Quantized L2 正式接入, 未延伸 §三十 禁止项。
+
+**限制 (非降级)**:
+- overlap_eff INT8 (0.763) < BF16 (0.853): 量化 D2H 更快 (11.26 vs 19.85ms), 但 wall 受 compute 主导 (~80ms),
+  故 overlap_eff 的分母 min(store,compute)=store, 量化 store 更小使比值略降。这是测量口径现象, 非功能缺陷;
+  量化实际 D2H 更快 (43%), 真实 overlap 价值不减。
+- BF16 vs Quantized overlap 须独立子进程 (同进程显存互斥), 已在 benchmark 用 subprocess 隔离。
+- Cold-vs-CPU-HIT 非 bit-exact (量化误差 ~0.66%), 正确性比对用 L1-vs-CPU (同 dequant), 符合 int8 语义。
+
+**STOP (§三十)**: 满足全部停止条件, 不继续 Pending Load Coalescing / Adaptive / Active KV Offload / ARC / SSD L3 / INT4 / CNRT C++。
+

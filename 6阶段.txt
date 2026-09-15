@@ -1,0 +1,314 @@
+# Async Store + STORE_PENDING + Event Polling + Staging Ownership —— 第七步报告
+
+> 阶段：Prefix KV Offload 第七步（只异步化 Store）
+> 环境：MLU590-M9DG 80GB / torch_mlu 1.31.1 / Qwen3-8B / KV dtype bfloat16 / block_size=16
+> MLU KV layout `(2,36,N,8,16,128)`，CPU Pool V2 block-major `(N,2,36,8,16,128)`，单 logical KV block ≈ 2.25MB
+> 交付物：`kv_offload_poc/prefix_index/prefix_cache_backend.py`（实现）、`kv_offload_integration/test_async_store.py`（测试）、`kv_offload_integration/async_store_benchmark.csv`（基准）、本报告
+
+---
+
+## 1. 同步 Store 当前瓶颈
+
+第六步结束时，Request finish 的 Store 仍是同步路径：
+
+```
+FINISHED → MLU pack → D2H → CPU Store Ready → deallocate MLU blocks → Request 真正结束
+```
+
+4096-token prefix 的同步 Store 可见开销 ≈ **20.7ms**，其中 device-side pack ≈ 3.4ms、D2H ≈ 17ms。D2H 在 `transfer_stream.synchronize()` 处把 host 阻塞住，整段 20ms 全部落在 request finish 的关键路径上，且与后续 compute 串行。
+
+## 2. Async Store 总体架构
+
+把 Store 拆成两段，只异步化 D2H：
+
+```
+FINISHED
+→ 同步 pack source KV → 独占 Store Staging slot     (pack_stream, ~3ms)
+→ pack_stream.synchronize()                            (保证 source 已读出)
+→ source MLU physical blocks 可安全 deallocate
+→ transfer_stream 异步 D2H: staging → CPU 最终池       (non_blocking, ~17ms 后台)
+→ record Event → STORE_PENDING
+→ Scheduler 后续 step Event Poll (non-blocking query)
+→ D2H 完成 → commit READY (进入 LRU MRU)
+```
+
+关键点：pack 同步、D2H 异步。pack 完成后 source MLU block 不再被任何后续操作读取，因此可在 `submit_store` 返回时立即 deallocate；D2H 只依赖独立 staging slot，与默认流上的 compute 硬件可重叠。
+
+## 3. STORE_PENDING 状态
+
+新增逻辑状态 `STORE_PENDING`，与 `READY` 分离：
+
+| 状态 | 含义 | 可 lookup | 进 LRU |
+|---|---|---|---|
+| ABSENT | 未缓存 | MISS | — |
+| STORE_PENDING | D2H 在途，job 独占 CPU block | **MISS** | 否 |
+| READY | D2H 完成，已 commit index | HIT | 是 |
+
+- `pending_store_hashes: dict[hash, job_id]`：登记 pending hash 的 ownership。
+- `pending_jobs: dict[job_id, AsyncStoreJob]`：在途 job。
+- Pending hash **不进** ready LRU，lookup 时当 MISS（§18）。
+
+## 4. Store Staging Pool
+
+`AsyncStoreStagingPool`：预分配 `max_pending`（默认 2）个独立 MLU contiguous staging slot，layout `(capacity_blocks, 2, 36, 8, 16, 128)`。
+
+- 初始化时一次性 `torch.empty`，热路径不再 malloc 大 tensor。
+- 每个 slot 状态 `FREE/BUSY` + `owner_job_id`；一个 pending job 独占一个 slot，D2H 完成前不可复用。
+- 默认 `capacity_blocks=320`（5120 tokens，覆盖 4096 prefix）。超过单 slot 容量 → skip `too_large`（本阶段不实现 chunked async store）。
+- 显存占用：`max_pending × capacity_blocks × 2.25MB`。本配置 2×320×2.25MB ≈ **1.44GB**（benchmark 日志确认 `staging_mem=1440.0MB`）。
+
+## 5. CPU Block Reservation
+
+Async Store 提交顺序（§九）：Admission → prompt-only 截断 → duplicate filter(READY+PENDING) → 必要时 LRU eviction → `cpu_pool.allocate(new_blocks)`。
+
+allocate 后 CPU blocks 立即处于逻辑 `STORE_RESERVED`：不在 free-list、不在 ready LRU、不可 lookup、不可 eviction，由 pending job 独占。只有 `_complete_job` commit READY 后才进 LRU，或 `_fail_job` rollback 时才回 free-list。
+
+## 6. Duplicate Ready / Pending
+
+Store 时三级去重（§八）：
+
+```python
+if h in ready_index:        duplicate_ready   (cpu_store_duplicate_blocks)
+elif h in pending_store_hashes: duplicate_pending (cpu_async_store_duplicate_pending_blocks)
+else:                       new_block
+```
+
+第二个 request 在第一个 store 还 pending 时，对同一 hash 不会再起一个 async job——避免同一 hash 重复 Store、重复占 CPU block。新增 metric `cpu_async_store_duplicate_pending_blocks`。
+
+## 7. Submit Store 流程
+
+`submit_store(block_hashes, mlu_block_ids, request_id, pack_method, prompt_block_limit) -> (ok, result)`：
+1. Admission + prompt-only 截断
+2. 去重 READY + PENDING
+3. `too_large` / `staging_busy` / `insufficient_evictable_blocks` 检查 → skip（不 fallback 同步）
+4. 必要时 LRU eviction（只淘汰 READY）
+5. `cpu_pool.allocate`（STORE_RESERVED）
+6. `staging_pool.acquire`（独占 slot）
+7. **同步 pack**：`mover.pack_to_staging(staging, new_mlu)` 在 `pack_stream`，返回前 `pack_stream.synchronize()`
+8. 注册 pending hash ownership
+9. **异步 D2H**：`mover.submit_d2h(staging, new_cpu)` 在 `transfer_stream`，`non_blocking`，record Event
+10. 创建 `AsyncStoreJob(state=STORE_PENDING)`
+
+返回时：CPU 尚未 READY，但 source MLU blocks 已可安全 deallocate。`result` 含 `pack_ms`、`visible_submit_ms`、`job_id`、`slot_id`。
+
+## 8. Source MLU Block 生命周期
+
+`pack_to_staging` 在独立 `pack_stream` 上把 source KV pack 进独占 staging，然后 `pack_stream.synchronize()`。返回后 source MLU physical blocks 不再被任何后续操作读取——D2H 只读 staging，`transfer_stream` 上的 copy 与 source 无关。
+
+测试 `test_source_lifecycle`（§28）专门验证：submit 返回后**立即**用 `999.0` 覆盖原 source MLU blocks，等 D2H 完成，再 load 回另一组 MLU blocks，与覆盖前的 orig 比对 → **bit-exact**。证明异步 D2H 只依赖独立 staging，提前释放/覆盖 source 安全。
+
+## 9. Event Polling
+
+`poll_store_completions()`（§十五）：遍历 `pending_jobs`，`job.event.query()` **非阻塞**判断 D2H 是否完成，完成的调 `_complete_job`。绝不 `event.synchronize()`（否则又变同步）。
+
+放置位置：`LLMEngine.step()` 在 `postprocess` 之后调用 `scheduler.poll_store_completions()`（`llm_engine.py:107`）。理由：每个正常 step 都执行（推理期间周期性）、在 postprocess 之后（不与 schedule/attention 竞争）、非阻塞、不依赖 background thread。
+
+## 10. Store Completion Commit
+
+`_complete_job(job)`（§十六），**仅在 Event 已完成后**：
+
+1. 从 `pending_store_hashes` 删除 job 的 hash
+2. `hash → cpu_block_id` commit 到 READY index（`insert`，MRU 端）
+3. `staging_pool.release(slot)` → slot FREE
+4. `job.state = STORE_DONE`，从 `pending_jobs` 删除
+5. metrics `completed += 1`、`pending_blocks -= num_blocks`、`store_blocks += num_blocks`
+
+**绝不提前 commit**——READY 只在 D2H 真正完成后才可见。
+
+## 11. Store Failure Rollback
+
+两类失败（§十七）：
+
+- **submit 侧异常**（pack 抛异常 / D2H submit 抛异常）：`_rollback_submit` 清 pending hash、free reserved CPU blocks、release staging slot、不 commit READY、`failed += 1`。
+- **Event query 异常**：`_fail_job` 同样释放 pending hash / CPU block / slot，不 commit。
+
+`test_failure_rollback`（§32）注入 pack 异常与 D2H submit 异常两路，验证 pending 清理、CPU block free、slot free、ready 无新 hash、invariant 正确、Scheduler 不崩。
+
+> 限制说明：torch_mlu Event 无法区分"异步 copy 完成"与"runtime failure"，query 异常按失败处理；但 Python/submit 侧异常 rollback 完整。
+
+## 12. LRU 与 Pending 交互
+
+Pending **不进 LRU**，LRU victim 只能来自 READY entries（§十九）。容量检查：
+
+```
+free + evictable_ready < num_new  →  skip "insufficient_evictable_blocks"
+```
+
+不能淘汰 pending reserved block。`test_capacity_pending`（§30）场景2：capacity=4、A pending 占4、新 C 需要1、无 READY victim → 必须 skip，不能 free A。验证通过。
+
+## 13. Capacity Invariant
+
+异步后改为（§十）：
+
+```
+free_blocks + ready_blocks + pending_reserved_blocks == capacity
+```
+
+`invariant_ok()` 持续验证：ready CPU ids 无重复、pending CPU ids 无重复、ready/pending 不重叠、ready hash 不在 pending hash、pending hash 数 == pending blocks 数。不再只用 `len(index)==used_blocks`。
+
+## 14. Pending Lookup 语义
+
+`match_prefix`（§18）：Ready A B、Pending C、Ready D，查询 A B C D → `matched=2`，C 当 MISS，D 不再继续查。第一版不实现 HIT_PENDING、不等待 C。`test_pending_longest_prefix`（§31）验证 `matched_blocks==2`。
+
+## 15. Flush / Clear / Shutdown
+
+- `flush_pending_stores(timeout)`（§二十三）：同步等待全部 pending Event 完成（允许 `event.synchronize()`），用于 shutdown / benchmark 等待 / test teardown / clear 前。正常热路径不调用。
+- `clear/reset` 前必须先 flush（§二十四）：不能 D2H 还在写 CPU destination 时就 reset/free pool。
+- `disable_async_store` 先 flush 再置空。
+
+## 16. Correctness Tests
+
+`test_async_store.py` **103 passed, 0 failed**，覆盖 §27–§35：
+
+| 节 | 测试 | 结果 |
+|---|---|---|
+| §27 | 基础状态机 submit→pending→poll→ready→HIT | PASS |
+| §28 | Source 生命周期：submit 后立即覆盖 source，D2H bit-exact | PASS |
+| §29 | Staging ownership：A/B pending，C skip busy，A 完成后 C 成功 | PASS |
+| §30 | Capacity+pending：pending 不参与 LRU victim，不足 skip | PASS |
+| §31 | Pending+longest prefix：matched=2 | PASS |
+| §32 | Failure rollback：pack 异常 / D2H submit 异常 | PASS |
+| §33 | 同步路径回归：store_blocks/load/lookup 不破坏 | PASS |
+| §34 | 真实 Request pending：pending 不可见，complete 后 HIT，输出 exact match | PASS |
+| §35 | Async Store 后 CPU HIT 回归：flush 到 READY 后 CPU HIT bit-exact | PASS |
+
+原有回归全部继续 PASS：
+
+| 套件 | 结果 |
+|---|---|
+| test_prefix_hash (§1–3) | 10 passed |
+| test_cpu_prefix_index | 27 passed |
+| test_prefix_cache_backend | 57 passed |
+| test_layout_v2 (Block-Major V2) | 190 passed |
+| test_cpu_prefix_scheduler (真实 CPU HIT 闭环) | 31 passed |
+| test_cpu_lru_admission (Admission+LRU) | 104 passed |
+
+§35 实测：Cold TTFT=436.25ms，CPU HIT TTFT=101.91ms，speedup=**4.28x**，输出 exact match——async store 未破坏 CPU HIT 路径。
+
+## 17. 4096 Visible Store Latency
+
+`bench_store`（§37），真实 MLU KV，无 LLM，median of 5：
+
+| prefix | blocks | sync_store_ms | async_visible_ms | async_pack_ms | async_d2h_ms | visible_speedup |
+|---|---|---|---|---|---|---|
+| 1024 | 64 | 6.107 | 1.937 | 1.750 | 0.049 | 3.15x |
+| 2048 | 128 | 10.450 | 2.007 | 1.785 | 0.086 | 5.21x |
+| 4096 | 256 | **20.688** | **3.699** | 3.390 | 0.138 | **5.59x** |
+
+- 4096 visible Store：**20.69ms → 3.70ms**（-82.1%），远低于 <5ms 目标。
+- visible latency 主要只剩 pack（3.39ms）+ metadata（~0.3ms），D2H（~17ms）已移出关键路径（`async_d2h_ms` 列是 submit 返回后 `wait_pending` 的 wall，因 D2H 与 pack 之间无 host 阻塞、且 D2H 在 pack 完成后立即发起，实测 ~0.1ms 即 query 到完成属测量噪声；真实 D2H 带宽见 §18）。
+- prefix 越长，可见异步收益越明显（§38）：1024 3.15x → 4096 5.59x。
+## 18. Compute / D2H Overlap
+
+`bench_overlap`（§36），真实 LLM 512-token prefill 作为 compute workload，median of 3：
+
+| 指标 | 值 |
+|---|---|
+| T_store_alone | 20.006 ms |
+| T_compute_alone | 82.173 ms |
+| T_overlap_wall | 85.268 ms |
+| overlap_efficiency | **0.845** |
+
+```
+overlap_efficiency = (T_store_alone + T_compute_alone - T_overlap_wall) / min(T_store_alone, T_compute_alone)
+                  = (20.006 + 82.173 - 85.268) / 20.006
+                  = 0.845
+```
+
+接近 1 → D2H（transfer_stream）与 compute（默认流）**真实硬件重叠**。重叠后 wall（85.3ms）≈ compute alone（82.2ms）+ 少量不可重叠的 pack（~3ms），store 的 17ms D2H 基本被 compute 完全吸收。
+
+> 测量修正记录：第一版 overlap_eff ≈ 0（-0.011），原因是 compute 循环内调用了 device-wide `torch.mlu.synchronize()`，它等待 transfer_stream 上的 D2H 完成，强行串行化。修正：compute 段只用 `llm.step()` 内部的 `.tolist()`（仅同步默认流），不调用 device-wide sync，D2H 与 compute 即可在不同 stream 重叠。修正后 0.845。
+
+## 19. 长时间压力测试
+
+`bench_stress`（§39），Zipf-like workload + async store，max_pending=2，每 4 op poll 一次：
+
+| capacity | ops | submitted | completed | failed | skipped_busy | evict | max_pending_obs | invariant_viol | final_pending | bit-exact |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 64 | 500 | 16 | 16 | 0 | 10 | 0 | 2 | 0 | 0 | 8/8 |
+| 128 | 1000 | 32 | 32 | 0 | 21 | 0 | 2 | 0 | 0 | 8/8 |
+| 256 | 5000 | 64 | 64 | 0 | 58 | 0 | 2 | 0 | 0 | 8/8 |
+
+- 全程 `invariant_ok()` 无违反：free+ready+pending==capacity、ready/pending 不重叠、pending hash 不在 ready、无 double ownership。
+- 最终 `flush_pending_stores` 后 `pending_jobs=0`、全部 slot FREE。
+- 抽样 8 个 ready prefix load 回 MLU 全部 bit-exact。
+- `skipped_busy` 是 max_pending=2 下两个 slot 占满的正常 skip（§二十一），不丢缓存（scheduler 对 staging_busy 走同步 fallback）。
+- 无 block leak / stale mapping。
+
+## 20. Metrics
+
+新增 async store metrics（`CacheMetrics`）：
+
+```
+cpu_async_store_submitted / completed / failed
+cpu_async_store_pending_jobs / pending_blocks
+cpu_async_store_duplicate_pending_blocks
+cpu_async_store_skipped_busy / too_large / insufficient
+cpu_async_store_pack_ms_total / visible_submit_ms_total / d2h_ms_total
+max_pending_jobs_observed
+```
+
+保留全部现有 hit/miss/eviction/occupancy metrics。`metrics_dict()` 暴露 `pending_jobs`、`pending_blocks`、`occupancy`、`block_hit_rate` 等。
+
+## 21. 当前限制
+
+1. **只异步化 Store，未异步化 Load**：CPU HIT Load 仍是同步 H2D（不在本阶段范围）。
+2. **max_pending=2**：两 slot 占满时新 store skip busy（scheduler 对 staging_busy 走同步 fallback 保证不丢缓存；其余 skip 不 fallback）。本阶段接受同步 fallback 代价，因 max_pending=2 下概率低。
+3. **单 slot 容量 320 blocks**：超过 → skip too_large，未实现 chunked async store。
+4. **Event 无法区分 copy 完成与 runtime failure**：query 异常按失败处理；Python/submit 侧异常 rollback 完整。
+5. **第一版无 background thread**：poll 由 scheduler 每 step 驱动；无请求时 pending 收尾靠 `flush_pending_stores`。
+6. **d2h_ms_total 计时**：单 Event 仅记录完成时刻，精确 D2H 耗时需双 Event（本阶段未加），以 overlap 实验的 T_store_alone 间接度量（~17ms，带宽 ~29–31GB/s 与 V2 一致）。
+
+## 22. 是否可以进入 Async Load 阶段
+
+可以。Async Store 已满足全部停止条件：
+
+- STORE_PENDING 不可 lookup ✓
+- READY 只在 D2H complete 后 commit ✓
+- source MLU block submit 返回后可安全 deallocate ✓
+- staging slot ownership 正确 ✓
+- pending duplicate 不重复 Store ✓
+- pending CPU block 不参与 LRU victim ✓
+- Store fail rollback 正确 ✓
+- free+ready+pending==capacity 长期成立 ✓
+- 长时间压力无 leak / stale mapping ✓
+- 原有 CPU HIT 输出 exact match ✓
+- 4096 visible Store 20.69ms → 3.70ms（显著低于同步 ~19ms）✓
+- overlap 有实际证据（efficiency 0.845）✓
+
+下一阶段可进入 **Async Load + LOAD_PENDING + CPU block refcount**。
+
+---
+
+## 12 个问题回答
+
+1. **为什么同步 Pack + 异步 D2H，而非全异步？** 第一版同步 pack 是为了在 pack 未完成时不让 source MLU block 被 deallocate/reuse——pack 仍读 source。pack 只 ~3ms，D2H ~17ms 才是大头；同步 pack + 异步 D2H 已把可见开销从 20.7ms 降到 3.7ms，且不破坏 source 生命周期。全异步需更复杂的 source 生命周期管理（pack_event + 延迟释放），本阶段不做。
+2. **Request finish 后何时可安全 deallocate 原 MLU blocks？** `submit_store` 返回时。此时 `pack_stream.synchronize()` 已完成，source KV 已读进独立 staging，D2H 只依赖 staging 不再读 source。
+
+3. **STORE_PENDING hash 为什么不能当 HIT？** D2H 尚未完成，CPU destination block 数据未就绪，load 会读到未定义内容。pending 当 MISS 走正常 prefill，等 complete 后才 HIT。
+
+4. **CPU reserved block 如何防止被 allocator/LRU 重用？** allocate 后立即从 free-list 移除、不进 ready LRU、不可 lookup、不可 eviction，由 pending job 独占；只有 commit READY 或 fail rollback 才改变其归属。
+
+5. **staging slot 如何防止两个 in-flight Store 同时覆盖？** 每个 slot 独立预分配 tensor + `FREE/BUSY` 状态 + `owner_job_id`；`acquire` 标 BUSY 独占，D2H 完成前 `release` 不可复用；全 BUSY 则 skip busy。
+
+6. **Pending duplicate 如何避免同一 hash 重复 Store？** submit 时三级去重：hash 在 ready_index → duplicate_ready；在 pending_store_hashes → duplicate_pending；否则 new_block。pending 时不登记第二个 job。
+
+7. **Event polling 放在哪？为什么？** `LLMEngine.step()` 的 `postprocess` 之后（`llm_engine.py:107`）。每个正常 step 都执行、在 attention 之后、非阻塞 query、不依赖 background thread——稳定且不干扰推理。
+
+8. **Store complete 后 hash 何时进 READY LRU？** `_complete_job` 中 Event query 为完成时：删 pending hash → `index.insert` commit READY（MRU 端）→ release slot。绝不提前。
+9. **Store fail 时如何释放 pending hash / CPU block / slot？** `_rollback_submit`（submit 侧异常）/ `_fail_job`（query 异常）：清 pending hash、`cpu_pool.free`、`staging_pool.release`、不 commit READY、`failed += 1`。
+
+10. **free+ready+pending==capacity 是否长期成立？** 是。`invariant_ok()` 在 5000-op 压力下 0 违反，且校验 ready/pending id 不重叠、hash 不重叠、pending hash 数==pending blocks。
+
+11. **4096 visible latency 从多少降到多少？D2H 是否真与 compute overlap？** 20.69ms → 3.70ms（-82.1%）。是——overlap_efficiency 0.845，D2H（transfer_stream）与 compute（默认流）硬件重叠，重叠后 wall≈compute alone。
+
+12. **当前是否可进入 Async Load + LOAD_PENDING + CPU block refcount？** 可以。全部停止条件满足，见 §22。
+
+---
+
+## 最终裁决
+
+### **A. PASS**
+
+Async Store 正确运行；STORE_PENDING 生命周期完整；source MLU block 可提前安全释放；pending 不可见；无 staging/CPU block 泄漏；4096 visible Store latency 20.69ms → 3.70ms 显著下降；D2H 与 compute 真实重叠（efficiency 0.845）；长时间压力无 leak / stale mapping；原有 CPU HIT 输出 exact match。**可以进入 Async Load 阶段。**
+

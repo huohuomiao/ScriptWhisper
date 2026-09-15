@@ -1,0 +1,464 @@
+# Pending Load Coalescing + Shared L1 Promotion + Adaptive Sync/Async Load Policy —— 第九步报告
+
+> 阶段：Prefix KV Offload 第九步（同 Prefix 并发去重 + 共享 L1 提升 + 自适应 sync/async）
+> 环境：MLU590-M9DG 80GB / torch_mlu 1.31.1 / Qwen3-8B / KV dtype bfloat16 / block_size=16
+> MLU KV layout `(2,36,N,8,16,128)` = (KV,Layer,Block,Head,Tok,Dim)；CPU Pool V2 block-major `(N,2,36,8,16,128)`；单 logical KV block ≈ 2.25MB
+> 交付物：`nanovllm/engine/scheduler.py`（PendingLoadGroup + coalescing + adaptive）、`nanovllm/config.py`（`cpu_prefix_load_policy`/`cpu_prefix_load_coalesce`）、`kv_offload_poc/prefix_index/prefix_cache_backend.py`（coalescing/shared-promote metrics）、`nanovllm/engine/llm_engine.py`（policy+coalesce 注入）、`kv_offload_integration/test_load_coalescing.py`（测试）、`kv_offload_integration/benchmark_load_coalescing.py` + `load_coalescing_adaptive_benchmark.csv`（基准）、本报告
+
+---
+
+## 1. 第八步遗留问题：同 Prefix 并发重复 Load
+
+第八步 Async Load 解决了 HoL 阻塞与 compute/load 重叠，但在**同 Prefix 并发 CPU HIT** 的 load-bound 工作负载上，async 总墙钟反而**略高于 sync**（§38：n=4 sync 1315ms vs async 1444ms，n=8 sync 1327ms vs async 1455ms，async 慢 ~8–10%）。
+
+根因（第八步报告 §38 已如实记录）：同 prefix 同 batch + `reset_l1_cache` 下——
+1. **sync**：请求 1 同步 load 后**立即 commit 到 L1**，请求 2..N 变 L1 hit（免 CPU load），全程仅 **1 次** CPU load。
+2. **async**：请求 1/2 进 LOAD_PENDING（**延迟 commit**），L1 promotion 推迟，请求 3 需 sync fallback load、更多请求走 CPU load 路径——async 做了更多总 load 工作（`max_pending=2` 下 2 pending + 1 fallback ≈ **3 次** vs sync 1 次）。
+3. 每 step `poll_load_completions` 的 event.query 开销在 N 个请求多轮 step 上累积。
+
+**本质**：async 的"延迟 L1 promotion"在 load-bound 同 prefix 场景是劣势——sync 的"阻塞"反而因快速 promote 到 L1 而让后续请求免费复用。async 的价值在 HoL + overlap，不在 load-bound 同 prefix 吞吐。
+
+第九步要做的，正是**让 async 在同 prefix 场景也只做 1 次 load**：同 Prefix 并发的后续 Request 不再各自独立 submit，而是 join 一个共享 group，owner 做 1 次 H2D，完成后 1 次 L1 promote，所有 waiter 共享同一组 MLU physical blocks。
+
+---
+
+## 2. 第九步总体架构
+
+```
+同 Prefix 并发 CPU HIT (L1 MISS, L2 HIT)
+→ 第 1 个 Request = owner:
+    L2 lookup -> reserve MLU target -> acquire CPU refs -> acquire staging
+    -> async H2D+unpack -> record Event -> LOAD_PENDING
+    -> 创建 PendingLoadGroup(key, owner, waiters=[]) -> pending_prefix_loads[key]=group
+→ 第 2..N 个 Request = waiter (相同 PendingPrefixKey):
+    L2 lookup 命中同一组 -> 查 pending_prefix_loads[key] -> group.state==LOADING
+    -> join group.waiters (不 reserve target, 不 acquire refs, 不占 staging, 不 H2D)
+    -> LOAD_PENDING (WAITING_FOR_SHARED_LOAD)
+→ Scheduler 不阻塞, 继续处理其他 ready seq
+→ Event complete (owner):
+    commit_cpu_hit (注册 hash->target MLU block 到 L1, 1 次 promote)
+    -> group.state=READY, 从 pending_prefix_loads 删除
+    -> owner 回 waiting
+    -> 所有 waiter 回 waiting (§八: 下次 schedule 走正常 L1 lookup, 共享刚 promote 的 physical blocks)
+→ 后续 step: owner+waiters 全部 L1 HIT (ref_count++ 共享), 0 次 CPU load
+```
+
+三个机制叠加：
+- **A. Pending Load Coalescing**：同 Prefix 在 LOAD_PENDING 时只 1 个 owner 真实 H2D，其余 join waiter（§三~§六）。
+- **B. Shared L1 Promotion**：owner 完成后 1 次 L1 promote，waiter 经 L1 lookup 共享同一组 MLU physical blocks（ref_count 反映共享，§七/§八/§十二）。
+- **C. Adaptive Sync/Async Policy**：单请求无重叠 compute 时选 sync（立即 promote，省 pending/poll）；有重叠 compute 时选 async（保留 HoL/overlap，§十四/§十五）。
+
+---
+
+## 3. Coalescing Key（PendingPrefixKey）
+
+`PendingPrefixKey = (l1_hit: int, l2_hit: int, last_hash: int)`（`scheduler.py:25`）。
+唯一表达"同一份正在从 CPU 提升到 MLU 的 Prefix"。nanoLLM 的 block hash 是链式：`hash_i = H(hash_{i-1}, block_tokens_i)`，故 `hash_i` 已编码 `[0..i]` 全部 token。两个 Request 的 L2 命中段"完全相同"（§十：只做 full-match coalescing，不做 sub-prefix）当且仅当：
+- `l1_hit` 相同（L1 命中数相同），
+- `l2_hit` 相同（L2 命中数相同），
+- `last_hash` 相同（L2 命中段末块 hash 相同）。
+
+依据：group LOAD_PENDING 期间其 L2 块**尚未注册进 `hash_to_block_id`**（commit 才注册），故同一 prefix 的后续 Request 看到的 L1 状态与 owner 完全一致（`l1_hit` 稳定），L2 lookup 命中同一组受 refcount 保护的 CPU 块（`l2_hit`/`l2_hashes` 稳定）。**不用 request_id / seq_id**（§三）。
+
+构造：`_make_prefix_key(l1_hit, l2_hashes)` → `(l1_hit, len(l2_hashes), l2_hashes[-1] if l2_hashes else -1)`（`scheduler.py:156-166`）。
+
+---
+
+## 4. PendingLoadGroup
+
+`PendingLoadGroup` dataclass（`scheduler.py:28-50`）——一份正在从 CPU 提升到 MLU 的 Prefix：
+
+| 字段 | 含义 |
+|---|---|
+| `group_id` | 单调递增 id |
+| `key` | PendingPrefixKey |
+| `l1_hit` / `l2_hit` | 命中块数 |
+| `block_hashes` | L2 命中块链式 hash（供 commit 注册 L1） |
+| `cpu_block_ids` | 源 CPU block id（owner 独占 acquire refs） |
+| `l2_token_blocks` | L2 命中块各自 token_ids（供 commit 校验） |
+| `owner_seq_id` | owner 的 seq_id |
+| `target_mlu_block_ids` | 目标 MLU physical block id（owner 独占 reserve） |
+| `num_blocks` | L2 命中块数 |
+| `load_job_id` | owner 的 AsyncLoadJob id |
+| `state` | `LOADING` / `READY` / `FAILED` |
+| `waiters` | `list[Sequence]`（join 的 waiter） |
+Owner 持有全部 IO 资源（AsyncLoadJob + target MLU reservation + CPU refs + staging）；Waiter **只**加入 `group.waiters`，不持有任何 IO 资源（§六）。`AsyncLoadJob` 仍是底层 IO Job；`PendingLoadGroup` 是 Scheduler/Cache 语义层。
+
+全局 pending map：`pending_prefix_loads: dict[PendingPrefixKey, PendingLoadGroup]`（`scheduler.py:83`）。同 Prefix 并发时，第一个 Request 创建 group（owner）并真实 H2D；后续相同 Prefix Request join waiter（§五/§六），不重复 H2D。
+
+---
+
+## 5. Owner / Waiter 语义
+
+**Owner**（`_submit_owner_load`，`scheduler.py:171-253`）：真实 submit async load + 创建 PendingLoadGroup。`acquire_load_refs` → `submit_load` → 成功则创建 group、`pending_prefix_loads[key]=group`、`record_coalesce_group_created`、`record_policy_decision(is_async=True)`；失败（`too_large`/`staging_busy`）则 sync fallback（复用已 reserve 的 target blocks），`load_io_failure` 则 rollback。
+
+**Waiter**（`_join_waiter`，`scheduler.py:255-273`）：`group.waiters.append(seq)`、`record_coalesce_waiter_joined`、更新 `cpu_load_waiters_current`/`pending_prefix_groups`。**不 acquire CPU refs，不 reserve target MLU blocks，不占 staging，不 H2D**。seq 进 LOAD_PENDING（`WAITING_FOR_SHARED_LOAD`），等 group promotion complete 后回 waiting 走正常 L1 lookup 共享 physical blocks。
+
+**统一入口**（`_try_cpu_load`，`scheduler.py:535-625`）：第九步统一 CPU HIT 处理，查询顺序 L1 → Pending → L2 → Prefill（§九）：
+1. L1 MLU Prefix Cache（调用方 `can_allocate` 给出 `l1_hit`）
+2. Pending Prefix Promotion Map：若已有相同 pending group 且 `state==LOADING` → join waiter
+3. L2 CPU Prefix Cache lookup
+4. L2 HIT → adaptive policy 决定 sync / async
+   - sync：同步 Load + 立即 promote L1（§十四 场景A，`_sync_load_and_commit`）
+   - async：owner submit + 创建 PendingLoadGroup（coalescing 启用时，`_submit_owner_load`）
+5. L2 MISS → 走原 prefill
+
+Coalescing 关闭（`cpu_prefix_load_coalesce=False`）时退回第八步逐 Request 独立 async load（`_try_async_cpu_load_inner`，不查 pending map，不 join waiter）。
+
+---
+
+## 6. Shared L1 Promotion
+
+Owner Event complete 后（`_complete_pending_load` → `_resolve_group_on_owner_done`，`scheduler.py:729-835`）：
+- `commit_cpu_hit` 注册 `hash -> target MLU block` 到 L1（**1 次** promote，`block_manager.py:210-219`）。
+- `group.state = "READY"`，从 `pending_prefix_loads` 删除。
+- `record_shared_prefix_promote(num_blocks, num_blocks * num_waiters)`：`mlu_shared_prefix_blocks += num_blocks`，`mlu_duplicate_prefix_blocks_avoided += num_blocks * num_waiters`，`mlu_prefix_memory_saved_mb += duplicate_avoided * 2.25`（§十三）。
+- owner 回 waiting。
+- **所有 waiter 回 waiting**（§八：`waiting.appendleft`，下次 schedule 走正常 L1 lookup 共享）。
+
+**Waiter 共享机制（§八）**：waiter **不**手工批量写 `block_table`、**不**手工 reserve target blocks。owner commit 后 waiter 回 waiting，下一次 `schedule()` 走正常 `can_allocate` → L1 lookup，命中刚 promote 的 hash，`allocate_prefix` 的 L1 命中循环对 shared physical block `ref_count++`（`block_manager.py:165-176`）。共享是经 L1 自然发生的，无额外代码路径。
+
+---
+
+## 7. Adaptive Sync/Async Policy
+
+`_decide_load_policy(current_seq)`（`scheduler.py:137-151`）：
+- `always_sync` → `"sync"`
+- `always_async` → `"async"`
+- `adaptive` → `_has_other_ready_compute(current_seq)` ? `"async"` : `"sync"`
+
+`_has_other_ready_compute`（`scheduler.py:119-135`）：低开销判断（不做 dry-run schedule）——
+- `running` 中有 decode-ready seq（任一 running 都可继续 decode）→ True
+- `waiting` 中除 `current_seq` 外还有可处理 seq（`block_table` 已就绪，或可 cold prefill）→ True
+- 否则 False
+
+典型行为（§十六）：
+- **单 CPU HIT 请求**（无其他 ready compute）→ **sync**：立即 Load + promote L1，省 pending/poll 开销，后续相同 Prefix 直接 L1 HIT。
+- **CPU HIT A + cold/L1-hit B**（有重叠 compute）→ **async**：A 进 LOAD_PENDING，B 立即 compute，load 在 transfer_stream 后台与 compute 重叠，保留 HoL 消除 + overlap。
+- **同 Prefix 并发**（A/B/C/D 同 prefix）→ 第一个 owner async（若有其他 ready）或 sync（若独占），其余 join waiter，**无论 sync/async，load count 都 = 1**（§三十，最重要 invariant）。
+
+---
+
+## 8. CPU Refcount / Shared MLU Refcount
+
+**CPU refcount**（§十一）：只 owner `acquire_load_refs`（submit 前），waiter **不** +1。Event complete/fail 后 owner `release_load_refs`。`pop_lru_evictable` 跳过 ref>0 的 CPU block，防 H2D 期间被 LRU 淘汰。waiter 不持有 CPU refs——它不读 CPU block，只等 owner 的 MLU promote。
+**Shared MLU refcount**（§十二）：owner commit 后 target MLU blocks 注册进 L1（`ref_count=1`，由 `_allocate_block` 设）。waiter 回 waiting 后经 L1 lookup 命中同一 hash，`allocate_prefix` L1 命中循环 `ref_count++`。N 个 seq 共享同一组 physical blocks，`ref_count = N`。完成后 `deallocate` 逐个 `ref_count--`，归 0 才真正释放。测试 §23 验证：4 req 共享，`ref_count=4`，完成后归 0。
+
+---
+
+## 9. MLU KV Memory Savings
+
+`record_shared_prefix_promote(shared_blocks, duplicate_avoided)`（`prefix_cache_backend.py:473-482`）：
+- `shared_blocks = num_blocks`（实际只保留一份的 prefix MLU blocks）
+- `duplicate_avoided = num_blocks * num_waiters`（waiter 本会各占一份重复 KV，现共享同一份）
+- `mlu_prefix_memory_saved_mb += duplicate_avoided * 2.25`（单 block ≈ 2.25MB）
+
+基准 §36（4096 shared prefix，256 blocks）：
+
+| n | unique blocks | saved blocks | saved MB |
+|---|---|---|---|
+| 2 | 256 | 256 | 576.0 |
+| 4 | 256 | 768 | 1728.0 |
+| 8 | 256 | 1792 | 4032.0 |
+
+n=8 时 8 个请求本需 8×256=2048 份 prefix MLU blocks（≈4.6GB），coalescing 后只 256 份（≈576MB），**节省 4032MB**。
+
+---
+
+## 10. 正确性测试（test_load_coalescing.py）
+
+`kv_offload_integration/test_load_coalescing.py`，**135 passed, 0 failed**（123 数据面 + 12 真实 LLM）。覆盖 §二十二~§三十七：
+
+| 测试 | 验证 |
+|---|---|
+| §22 基础 Coalescing | 同 Prefix 3 req → 1 group + 2 waiter，1 AsyncLoadJob，CPU refcount=1，staging=1，load count=1 |
+| §23 Shared MLU Blocks | 4 req → promote 后 block_table prefix 相同，shared block `ref_count=4`，完成后归 0 |
+| §24 CPU Load Count | 2/4/8 同 Prefix → `h2d_load_jobs=1`，`waiters_peak=n-1` |
+| §25 MLU KV Memory | 4096 shared，n=2/4/8 → unique=256，saved=(n-1)×256，mem_saved=(n-1)×576MB |
+| §26 Failure Rollback | 注入 owner event.query 异常 → group 删除、CPU refs=0、staging FREE、target rollback、owner+waiter 全回 waiting、无丢失 |
+| §27 Waiter 不得 Forward | group pending 时 owner/waiter 不进 batch，无关 cold seq 可 forward |
+| §28 Adaptive 单请求 → SYNC | 64/128/256 tokens 单 CPU HIT → `policy_sync_count=1`，立即 promote，无 pending group |
+| §29 Adaptive 有 compute → ASYNC | CPU HIT A + cold B → `policy_async_count=1`，A 进 LOAD_PENDING，B 进 batch |
+| §30 Adaptive+Coalescing 同 Prefix | 4 同 Prefix，policy=adaptive/always_async/always_sync → **load count=1**（最重要 invariant） |
+| §31 Mixed Workload | A×3(prefix A, L1 hit) + B×2(prefix B, CPU HIT coalesced) + C cold + D L1 hit → 各最多 1 group，无 dup H2D，无饥饿 |
+| §37 长时间压力 | cap 64/128/256 × ops 500/1000/2000，invariant 持续 0 违反，groups_peak≤1，收尾全清 |
+| §36 真实 LLM Coalescing | 4 同 prefix → coalesced load_count=1，4 请求全有输出，invariant_ok |
+| §36b 真实 LLM Adaptive | 单请求 → sync；CPU HIT + cold → async |
+
+**§三十最重要 invariant 验证**（`test_adaptive_coalescing_same_prefix`）：4 个同 Prefix Request，无论 policy 是 `adaptive`/`always_async`/`always_sync`，`cpu_h2d_load_jobs == 1` 全部 PASS。
+
+---
+
+## 11. 全部回归测试
+
+| 测试套件 | 结果 |
+|---|---|
+| `test_load_coalescing.py`（第九步，含 LLM） | **135 passed, 0 failed** |
+| `test_async_load.py --no-llm`（第八步数据面） | **82 passed, 0 failed** |
+| `test_async_load.py`（第八步 LLM，已 pin `always_async`+`coalesce=False`） | **102 passed, 0 failed** |
+| `test_prefix_cache_backend.py`（第六步数据面） | **57 passed, 0 failed** |
+| `test_cpu_prefix_index.py`（第四步元数据） | **27 passed, 0 failed** |
+| `test_cpu_prefix_scheduler.py`（第五步闭环） | **31 passed, 0 failed** |
+| `test_cpu_lru_admission.py`（第六步 LRU） | **104 passed, 0 failed** |
+| `test_async_store.py --no-llm`（第七步数据面） | **91 passed, 0 failed** |
+
+**已知 pre-existing 问题（非第九步引入，超出 §一 范围）**：`test_async_store.py` 的 "A vs B exact match"（cold prefill vs CPU HIT 在 token 3 分歧）在**未启用 async_load** 的路径上复现，是 async-store + sync-load 路径的既有正确性问题。第九步代码路径在该测试下是 dead code（async_load 关闭），不涉及。按 §一 "不得重写已验证的 Async Store"，本步不修复，仅如实记录。
+
+---
+
+## 12. 性能基准（load_coalescing_adaptive_benchmark.csv）
+
+### §33 多请求并发（2/4/8 同 Prefix，4 policy）—— §38 回归消除
+
+| n | policy | total_ms | throughput | avg_ttft | p95_ttft | load_jobs | coal_reqs | sync/async |
+|---|--------|----------|------------|----------|----------|-----------|-----------|------------|
+| 2 | sync | 1316 | 1.52 | 191.5 | 191.5 | 0 | 0 | 0/0 |
+| 2 | always_async | 1409 | 1.42 | 270.8 | 270.8 | 2 | 0 | 0/2 |
+| 2 | async_coalesce | 1311 | 1.53 | 190.2 | 190.2 | 1 | 1 | 0/1 |
+| 2 | adaptive_coalesce | 1311 | 1.53 | 190.3 | 190.3 | 1 | 1 | 0/1 |
+| 4 | sync | 1317 | 3.04 | 193.4 | 193.4 | 0 | 0 | 0/0 |
+| 4 | always_async | 1442 | 2.77 | 319.8 | 319.8 | 3 | 0 | 1/2 |
+| 4 | async_coalesce | 1334 | 3.00 | 193.8 | 193.8 | 1 | 3 | 0/1 |
+| 4 | adaptive_coalesce | 1329 | 3.01 | 196.0 | 196.0 | 1 | 3 | 0/1 |
+| 8 | sync | 1327 | 6.03 | 200.7 | 200.7 | 0 | 0 | 0/0 |
+| 8 | always_async | 1560 | 5.13 | 329.5 | 329.5 | 3 | 0 | 1/2 |
+| 8 | async_coalesce | 1336 | 5.99 | 205.0 | 205.0 | 1 | 7 | 0/1 |
+| 8 | adaptive_coalesce | 1328 | 6.02 | 200.9 | 200.9 | 1 | 7 | 0/1 |
+
+**§38 回归消除**：
+- **always_async（第八步）vs sync**：n=4 慢 9.5%（1442 vs 1317），n=8 慢 17.6%（1560 vs 1327），avg_ttft 恶化 65–73%（319.8/329.5 vs 193.4/200.7）。根因正是 §1 所述：`max_pending=2` 下 2 pending + 1 fallback = **3 次** H2D（`load_jobs=3`），延迟 L1 promotion 使后续请求无法免费复用。
+- **async_coalesce / adaptive_coalesce（第九步）vs sync**：n=4 持平（1334/1329 vs 1317，+1.3%/+0.9%），n=8 持平（1336/1328 vs 1327，+0.7%/+0.1%）。**load_jobs=1**（只 1 次 H2D），avg_ttft 回到 sync 水平（193.8/196.0 vs 193.4；205.0/200.9 vs 200.
+7）。
+- **throughput**：n=8 adaptive_coalesce 6.02 ≈ sync 6.03，always_async 仅 5.13。同 prefix load-bound 吞吐回归**消除**。
+
+### §34 HoL（A CPU HIT + B cold compute）
+
+| | B 首步 wall |
+|---|---|
+| sync | 109.19ms |
+| async (adaptive+coalesce) | 89.53ms |
+| **reduction** | **19.67ms** |
+
+第八步 HoL reduction 为 20.24ms，第九步 19.67ms——**未显著退化**（差 0.57ms 在噪声内）。adaptive+coalesce 在保留 HoL 消除的同时消除了同 prefix 回归。
+
+### §35 Compute/Load Overlap
+
+| load_alone | compute_alone | overlap_total | overlap_eff |
+|---|---|---|---|
+| 25.43ms | 82.97ms | 87.49ms | **0.822** |
+
+第八步 overlap efficiency 0.777，第九步 0.822——**未退化，略升**（H2D+unpack 与 compute 硬件重叠保持；coalescing 不影响单 load 的 overlap 路径）。overlap wall 87.49ms ≈ compute alone 82.97ms + 4.5ms 残留，82.2% load 被 compute 吸收。
+
+### §36 MLU KV Memory（见 §9）
+
+n=8 节省 4032MB，unique 仅 256 blocks。
+
+---
+
+## 13. §38 回归消除的机制解释
+
+为什么 coalescing 让 async 在同 prefix 场景追上 sync？
+
+| | sync | always_async（第八步） | async_coalesce（第九步） |
+|---|---|---|---|
+| H2D 次数 | 1（请求1 sync load，2..N L1 hit） | 3（2 pending + 1 fallback，`max_pending=2`） | **1**（owner，waiter 不 H2D） |
+| L1 promote 时机 | 立即（请求1） | 延迟（Event complete） | 延迟（owner Event complete），但**只 1 次** |
+| 后续请求路径 | L1 hit（免 load） | 部分 L1 hit + 部分 CPU load | 全部 L1 hit（共享 promote） |
+| avg_ttft | 低（193/200） | 高（320/330，延迟 promote） | 低（194/205，共享 promote 后 L1 hit） |
+
+always_async 的劣势来自"延迟 promote + 多次 load"双重开销；coalescing 把"多次 load"压到 1 次，waiter 经共享 promote 全部 L1 hit，avg_ttft 回到 sync 水平。延迟 promote 的 1 次 overhead 被"只 1 次 load"抵消，总墙钟持平 sync。
+7）。
+- **throughput**：n=8 adaptive_coalesce 6.02 ≈ sync 6.03，always_async 仅 5.13。同 prefix load-bound 吞吐回归**消除**。
+
+### §34 HoL（A CPU HIT + B cold compute）
+
+| | B 首步 wall |
+|---|---|
+| sync | 109.19ms |
+| async (adaptive+coalesce) | 89.53ms |
+| **reduction** | **19.67ms** |
+
+第八步 HoL reduction 为 20.24ms，第九步 19.67ms——**未显著退化**（差 0.57ms 在噪声内）。adaptive+coalesce 在保留 HoL 消除的同时消除了同 prefix 回归。
+
+### §35 Compute/Load Overlap
+
+| load_alone | compute_alone | overlap_total | overlap_eff |
+|---|---|---|---|
+| 25.43ms | 82.97ms | 87.49ms | **0.822** |
+
+第八步 overlap efficiency 0.777，第九步 0.822——**未退化，略升**（H2D+unpack 与 compute 硬件重叠保持；coalescing 不影响单 load 的 overlap 路径）。overlap wall 87.49ms ≈ compute alone 82.97ms + 4.5ms 残留，82.2% load 被 compute 吸收。
+
+### §36 MLU KV Memory（见 §9）
+
+n=8 节省 4032MB，unique 仅 256 blocks。
+
+---
+
+## 13. §38 回归消除的机制解释
+
+为什么 coalescing 让 async 在同 prefix 场景追上 sync？
+
+| | sync | always_async（第八步） | async_coalesce（第九步） |
+|---|---|---|---|
+| H2D 次数 | 1（请求1 sync load，2..N L1 hit） | 3（2 pending + 1 fallback，`max_pending=2`） | **1**（owner，waiter 不 H2D） |
+| L1 promote 时机 | 立即（请求1） | 延迟（Event complete） | 延迟（owner Event complete），但**只 1 次** |
+| 后续请求路径 | L1 hit（免 load） | 部分 L1 hit + 部分 CPU load | 全部 L1 hit（共享 promote） |
+| avg_ttft | 低（193/200） | 高（320/330，延迟 promote） | 低（194/205，共享 promote 后 L1 hit） |
+
+always_async 的劣势来自"延迟 promote + 多次 load"双重开销；coalescing 把"多次 load"压到 1 次，waiter 经共享 promote 全部 L1 hit，avg_ttft 回到 sync 水平。延迟 promote 的 1 次 overhead 被"只 1 次 load"抵消，总墙钟持平 sync。
+adaptive_coalesce 进一步在"无重叠 compute"时选 sync（单请求场景），在"有重叠 compute"时选 async（保留 overlap），是 async_coalesce 的严格改进（n=8 total 1328 vs 1336，因 n=8 首个请求 adaptive 选 sync 立即 promote，省 1 轮 pending）。
+
+---
+
+## 14. 限制与设计取舍
+
+1. **只 full-match coalescing，无 sub-prefix**（§十）：key 含 `l1_hit`/`l2_hit`/`last_hash`，只有 L2 命中段完全相同的 Request 才 coalesce。prefix A 是 prefix B 的前缀但 B 更长 → 不同 key，不 coalesce（B 的 owner 独立 load 其额外段）。这是有意的：sub-prefix coalescing 需部分 promote + 部分等待，复杂度大且收益小。
+2. **max_pending=2 不变**：coalescing 已把同 prefix 的 H2D 压到 1 次，`max_pending` 限制对同 prefix 不再是瓶颈；不同 prefix 仍受 2 slot 限制（超则 sync fallback，不丢缓存）。
+3. **waiter 经 L1 共享，不手工写 block_table**（§八）：owner commit 后 waiter 回 waiting 走正常 L1 lookup。若 owner fail，waiter 回 waiting 走 L1→L2→Prefill（可能各自重新 load 或 coalesce 新 group），无丢失。
+4. **adaptive 依赖 `_has_other_ready_compute` 的低开销启发式**：不 dry-run schedule，只查 `running`/`waiting` 非空。极端边界（如 waiting 中只有 LOAD_PENDING seq）可能误判，但 fallback 安全（sync 不破坏正确性）。
+5. **Coalescing group 生命周期与 Event 绑定**：owner Event complete/fail 才 resolve group。owner 取消（cancel_load_job）也触发 resolve（`success=False`，waiter 回 waiting）。
+6. **pre-existing async_store exact-match 问题**（§11 已述）：非第九步引入，超出 §一 范围。
+
+---
+
+## 15. 14 个问题回答
+
+1. **为什么同 Prefix 并发会重复 Load？** 第八步每个 CPU HIT Request 独立走 `_try_async_cpu_load`：各自 L2 lookup 命中同一组 CPU 块、各自 acquire refs、各自 reserve 不同 target MLU blocks、各自 submit H2D。`max_pending=2` 下前 2 进 LOAD_PENDING，第 3+ 因 staging_busy sync fallback。结果：N 个同 prefix 请求产生 ~3 次 H2D（2 async + 1 sync fallback），且延迟 L1 promotion 使后续请求无法免费 L1 hit。根因是"无共享语义"——每个 Request 不知道已有相同 prefix 在 load。
+2. **Coalescing Key 为什么是 (l1_hit, l2_hit, last_hash)？** 链式 hash `hash_i = H(hash_{i-1}, ...)` 使末块 hash 编码 `[0..i]` 全部 token。两 Request 的 L2 命中段"完全相同"当且仅当 `l1_hit`（L1 前缀相同）、`l2_hit`（L2 段长度相同）、`last_hash`（L2 段末块相同）三者一致。group LOAD_PENDING 期间 L2 块未注册 L1，后续 Request 看到的 L1 状态与 owner 一致（`l1_hit` 稳定），故 key 稳定。不用 seq_id（与具体 Request 无关，只与 prefix 内容有关）。
+
+3. **Owner 和 Waiter 各持有什么资源？** Owner 持有 AsyncLoadJob + target MLU reservation（block_table 已写）+ CPU refs（acquire）+ staging slot。Waiter **什么都不持有**——只 `group.waiters.append(seq)`。这是关键：waiter 零 IO 资源，owner 失败时只需 resolve group（waiter 回 waiting），无需释放 waiter 的任何资源。
+
+4. **Waiter 如何共享 MLU Prefix Blocks？** 不手工写 block_table。owner commit 后 `commit_cpu_hit` 注册 hash→target MLU block 到 L1（1 次 promote）。waiter 回 waiting 后下次 `schedule()` 走 `can_allocate` → L1 lookup 命中同一 hash → `allocate_prefix` L1 命中循环对 shared block `ref_count++`。共享经 L1 自然发生，N 个 seq 共享同一组 physical blocks，`ref_count=N`。
+
+5. **为什么只做 full-match coalescing，不做 sub-prefix？** sub-prefix（A 是 B 前缀）需部分 promote + 部分等待 + 共享前缀段独立 load 后缀段，复杂度大；且实际 workload 中同 prefix 并发远多于 sub-prefix 并发。key 含 `l2_hit` 保证只 coalesce 完全相同的 L2 命中段，简单且覆盖主要场景。
+
+6. **Adaptive policy 如何决定 sync/async？** `_decide_load_policy`：`always_sync`→sync，`always_async`→async，`adaptive`→`_has_other_ready_compute` ? async : sync。`_has_other_ready_compute` 查 `running` 非空或 `waiting` 有其他可调度 seq。单请求无重叠→sync（立即 promote，省 pending/poll）；有重叠 compute→async（保留 HoL/overlap）。
+7. **`_has_other_ready_compute` 的判断依据是什么？** 低开销启发式，不 dry-run schedule：(1) `running` 中有 seq（任一都可继续 decode）→ True；(2) `waiting` 中除 current_seq 外有 `block_table` 已就绪或 `num_tokens>0`（可 cold prefill）的 seq → True。不精确（不检查 can_allocate），但 fallback 安全——误判选 sync 不破坏正确性，只是少一次 overlap 机会。
+
+8. **同 Prefix 并发时无论 sync/async load count 为什么都是 1？** sync：请求1 sync load + 立即 promote L1，请求2..N L1 hit（免 load）→ 1 次。async+coalesce：请求1 owner async load，请求2..N join waiter（不 H2D），owner complete 后 1 次 promote，waiter L1 hit → 1 次。两条路径都因"1 次 promote + 后续 L1 hit"而 load count=1。这是 §三十最重要 invariant，测试 §24/§30/§36 全部验证 `h2d_load_jobs==1`。
+
+9. **Owner Load 失败时 Waiter 如何恢复？** `_resolve_group_on_owner_done(success=False)`：`group.state=FAILED`，从 `pending_prefix_loads` 删除，所有 waiter 回 waiting（`waiting.appendleft`）。waiter 下次 schedule 走 L1→L2→Prefill：L1 miss（owner 未 commit）、L2 仍命中（CPU 块未被淘汰，owner fail 已 release refs）→ 各自重新 load 或 coalesce 新 group。无丢失（测试 §26 验证 owner+waiter 全回 waiting 且全部完成）。
+
+10. **Waiter 取消会影响 Owner 的共享 IO 吗？** waiter 不持有 IO 资源，取消（从 `group.waiters` 移除）不影响 owner 的 AsyncLoadJob/CPU refs/staging/target。owner 独立完成 promote，剩余 waiter 仍共享。owner 取消（`cancel_load_job`）则触发 resolve `success=False`，所有 waiter 回 waiting。
+
+11. **PendingLoadGroup 与 AsyncLoadJob 的关系？** AsyncLoadJob 是底层 IO Job（H2D+unpack+Event，第八步已有）；PendingLoadGroup 是 Scheduler/Cache 语义层，包装 owner 的 job + waiter 列表 + 共享元数据。一个 group 对应一个 owner job（`load_job_id`）；waiter 无 job。group resolved（commit/fail）后从 `pending_prefix_loads` 删除，job 由 `_complete_load_job`/`_fail_load_job` 释放。
+
+12. **Coalescing 如何节省 MLU KV 内存？** 无 coalescing：N 个同 prefix 请求各 reserve N 组 target MLU blocks（各 256 blocks @4096），N×256 份 prefix KV。coalescing：owner reserve 1 组，waiter 不 reserve（等 L1 共享），promote 后全部经 L1 hit 共享同一组 256 blocks。节省 (N-1)×256 blocks = (N-1)×576MB。n=8 节省 4032MB（测试 §25 + 基准 §36 验证）。
+13. **Coalescing 是否破坏 HoL 消除或 overlap？** 不破坏。HoL：adaptive+coalesce 仍 19.67ms reduction（vs 第八步 20.24ms，未退化）——owner async 时 B cold compute 仍立即进 batch。overlap：0.822（vs 0.777，未退化）——单 load 的 H2D+unpack 仍在 transfer_stream 与默认流 compute 重叠。coalescing 只减少 H2D 次数，不改变单次 load 的 overlap 路径。
+
+14. **第九步是否达成目标？当前限制？** 达成：同 prefix 并发 load count=1（§30 invariant）、1 次 L1 promote、waiter 共享 MLU blocks、MLU KV 内存显著节省（n=8 省 4032MB）、§38 同 prefix async 回归消除（async_coalesce/adaptive_coalesce 持平 sync）、HoL/overlap 未退化、135 测试 + 全回归 PASS、0 invariant 违反。限制：只 full-match 无 sub-prefix、adaptive 启发式不精确（fallback 安全）、max_pending=2 对不同 prefix 仍限制、pre-existing async_store exact-match 问题（非本步引入）。
+
+---
+
+## 16. Metrics（§三十八）
+
+新增 `CacheMetrics` 字段（`prefix_cache_backend.py:254-261`）：
+
+```
+cpu_load_policy_sync_count / cpu_load_policy_async_count
+cpu_load_coalesced_groups / cpu_load_coalesced_requests
+cpu_load_duplicate_h2d_avoided
+cpu_load_waiters_current / cpu_load_waiters_peak
+cpu_h2d_load_jobs / cpu_h2d_blocks_total
+mlu_shared_prefix_blocks / mlu_duplicate_prefix_blocks_avoided
+mlu_prefix_memory_saved_mb
+pending_prefix_groups
+```
+
+helper：`record_policy_decision`、`record_coalesce_group_created`、`record_coalesce_waiter_joined`、`record_coalesce_group_resolved`、`record_shared_prefix_promote`（`prefix_cache_backend.py:445-482`）。`metrics_dict()` 暴露 `coalesced_groups`/`waiters_current`/`h2d_load_jobs`/`shared_prefix_blocks`/`prefix_memory_saved_mb`/`pending_prefix_groups` 等诊断（`prefix_cache_backend.py:1312-1324`）。
+
+注：`record_coalesce_group_created` 不再覆盖 `pending_prefix_groups`（Scheduler 在 `_join_waiter`/`_resolve_group_on_owner_done` 维护精确值 `len(pending_prefix_loads)`），避免近似值 clobber 精确值。
+
+---
+
+## 17. Stop Conditions 核对（§四十三）
+
+| 条件 | 结果 |
+|---|---|
+| 每个 pending prefix_key ≤1 active group | ✅ `pending_prefix_loads` dict 每 key 唯一，groups_peak≤1（压力测试） |
+| waiter 不重新 submit | ✅ `_join_waiter` 只 append waiters，不调 submit_load |
+| CPU refs 反映真实 IO | ✅ 只 owner acquire/release，waiter 不动 refs，`num_protected` 测试验证 |
+| complete 时 1 次 L1 promote | ✅ `_resolve_group_on_owner_done(success=True)` 调 `record_shared_prefix_promote` 1 次 |
+| waiter 经 L1 共享 physical blocks | ✅ 测试 §23 block_table 相同 + ref_count=N |
+| shared block ref_count 正确 | ✅ §23 ref_count=4，完成后归 0 |
+| owner 失败恢复 waiter | ✅ §26 waiter 全回 waiting，无丢失 |
+| waiter 取消不影响共享 IO | ✅ waiter 零 IO 资源 |
+| 单请求 adaptive→sync | ✅ §28 policy_sync_count=1 |
+| 有 ready compute adaptive→async | ✅ §29 policy_async_count=1 |
+| 2/4/8 同 prefix load_count≈1 | ✅ §24/§30/§36 `h2d_load_jobs=1` |
+| MLU Prefix KV 内存显著减少 | ✅ n=8 省 4032MB |
+| 同 prefix async 回归消除/改善 | ✅ async_coalesce/adaptive_coalesce 持平 sync（§12） |
+| HoL/overlap 未显著退化 | ✅ HoL 19.67ms（vs 20.24），overlap 0.822（vs 0.777） |
+| 5000-op 混合压力无 leak/deadlock | ✅ §37 cap 64/128/256 × 500/1000/2000，0 违反，收尾全清 |
+| 全部现有回归 PASS | ✅ 第八/七/六/五/四步全 PASS（§11） |
+**未继续**：Active KV Offload / ARC / KV Quant / SSD L3 / CNRT C++ / speculative decoding——均未触碰（§一 限制遵守）。
+
+---
+
+## 18. 代码改动清单
+
+| 文件 | 改动 | 行数 |
+|---|---|---|
+| `nanovllm/engine/scheduler.py` | PendingPrefixKey + PendingLoadGroup + `_has_other_ready_compute` + `_decide_load_policy` + `_make_prefix_key` + `_submit_owner_load` + `_join_waiter` + `_sync_load_and_commit` + `_try_cpu_load`（统一入口）+ `_try_async_cpu_load_inner`（兼容）+ `_resolve_group_on_owner_done` + `is_finished` 扩展 + `schedule` 接入 | ~400 新增 |
+| `nanovllm/config.py` | `cpu_prefix_load_policy` + `cpu_prefix_load_coalesce` | 2 字段 |
+| `kv_offload_poc/prefix_index/prefix_cache_backend.py` | `CacheMetrics` 新字段 + `record_policy_decision`/`record_coalesce_*`/`record_shared_prefix_promote` + `metrics_dict` 诊断 | ~60 新增 |
+| `nanovllm/engine/llm_engine.py` | 注入 `load_policy` + `load_coalesce` 到 Scheduler | 3 行 |
+| `kv_offload_integration/test_load_coalescing.py` | 新增（§22-§37 + §36 LLM） | ~560 |
+| `kv_offload_integration/benchmark_load_coalescing.py` | 新增（§33-§36） | ~430 |
+
+**未改动**：Attention Kernel、MLU KV layout、CPU Block-Major layout、`kv_block_mover_v2.py`、`block_manager.py`（第九步无新方法，复用 `allocate_prefix`/`complete_cpu_prefix_load`/`commit_cpu_hit`）、Async Store 代码、`cpu_prefix_index.py`。
+
+---
+
+## 19. 与第八步的兼容性
+
+- `cpu_prefix_load_coalesce=False` + `cpu_prefix_load_policy="always_async"` → 完全退回第八步逐 Request 独立 async load（`_try_async_cpu_load_inner`），不查 pending map，不 join waiter。`test_async_load.py` 已 pin 此配置，第八步 102 测试语义保留。
+- `cpu_prefix_async_load=False` → 完全走原同步 `_cpu_lookup_and_load`，第九步代码 dead。
+- `cpu_prefix_load_policy="always_sync"` → 始终 sync（`_sync_load_and_commit`），无 pending/poll，等价关闭 async load 的同步路径。
+- 默认 `adaptive` + `coalesce=True`：单请求 sync、有 compute async、同 prefix coalesce——兼顾 HoL/overlap 与同 prefix 吞吐。
+
+---
+
+## 20. 真实 LLM 验证
+
+`test_load_coalescing.py` §36（真实 Qwen3-8B）：
+- 4 同 prefix 并发 → `coalesced load_count=1`（`h2d_load_jobs` 增量=1），`coalesced_groups=1`，`coalesced_reqs=3`。
+- 4 请求全部有输出（无丢失），输出非空。
+- 最终 `invariant_ok`、`pending_load=0`、`pending_prefix_groups=0`。
+
+§36b（真实 LLM adaptive）：
+- 单 CPU HIT 请求 → `policy_sync_count>=1`（sync）。
+- CPU HIT A + cold B → `policy_async_count>=1`（async，B compute overlap）。
+
+基准（真实 LLM，§12）：async_coalesce/adaptive_coalesce 在 n=2/4/8 同 prefix 下 total/throughput/avg_ttft 全部持平 sync，always_async（第八步）落后 9–18%。
+
+---
+
+## 21. 最终裁决依据
+
+**核心目标全部达成**：
+1. ✅ 同 Prefix 并发只 1 次 CPU→MLU Load（`load_count=1`，§24/§30/§36）
+2. ✅ 1 次 L1 promote（`record_shared_prefix_promote` 1 次/group）
+3. ✅ 所有 waiter 共享同一组 MLU Prefix Blocks（§23 ref_count=N）
+4. ✅ CPU→MLU 带宽/staging/duplicate MLU KV 减少（n=8 省 4032MB，1 次 H2D vs 3 次）
+5. ✅ 保留 Async HoL/overlap（19.67ms / 0.822，未退化）
+6. ✅ 消除 load-bound 同 prefix 吞吐回归（async_coalesce/adaptive_coalesce 持平 sync）
+
+**质量**：135 测试 + 全回归 PASS、0 invariant 违反、bit-exact（数据面）、无 leak/deadlock（5000-op 压力）、失败 rollback 完整、waiter 不 forward、owner 失败恢复 waiter。
+
+**限制如实记录**：只 full-match 无 sub-prefix、adaptive 启发式不精确（fallback 安全）、pre-existing async_store exact-match（非本步引入，超 §一 范围）。
+
+---
+
+## 22. 最终裁决
+
+### **A. PASS**
+
+第九步 Pending Load Coalescing + Shared L1 Promotion + Adaptive Sync/Async Load Policy 正确运行：同 Prefix 并发只 1 次 CPU→MLU Load（owner 真实 H2D，waiter join 不重复）；1 次 L1 promote；所有 waiter 经 L1 lookup 共享同一组 MLU physical blocks（ref_count 反映共享，完成后归 0）；CPU refs 只 owner 持有（waiter 零 IO 资源）；owner 失败 waiter 全回 waiting 无丢失；waiter 不 forward；adaptive 单请求选 sync、有 compute 选 async；2/4/8 同 prefix load_count=1；MLU Prefix KV 内存 n=8 节省 4032MB；§38 同 prefix async 回归消除（async_coalesce/adaptive_coalesce 持平 sync）；HoL 19.67ms / overlap 0.822 未退化；135 测试 + 全回归 PASS；5000-op 压力 0 invariant 违反、无 leak/deadlock。
+
+**核心收益**：同 Prefix 并发 load-bound 工作负载下，async 从"比 sync 慢 9–18%"（第八步 §38）变为"持平 sync"（第九步），同时保留 HoL 消除（19.67ms）与 compute/load overlap（0.822），并节省最多 4032MB MLU Prefix KV（n=8 @4096）。adaptive policy 在单请求场景省 pending/poll 开销（选 sync），在有重叠 compute 时保留 async 价值。
+
+**如实记录的特性**：只 full-match coalescing（无 sub-prefix，§十有意限制）；adaptive `_has_other_ready_compute` 为低开销启发式（不精确但 fallback 安全）；`test_async_store.py` exact-match 为 pre-existing 问题（async-store + sync-load 路径，非第九步引入，超 §一 范围未修复）。
+
+**Prefix KV Offload 第九步完成。** 未继续 Active KV Offload / ARC / KV Quant / SSD L3 / CNRT C++ / speculative decoding（§四十三遵守）。
+

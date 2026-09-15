@@ -1,0 +1,397 @@
+# KV Cache INT8 量化验证报告 (下一阶段: 容量预算修正 + Prefix Map 生命周期 + 完整验证)
+
+> 环境: MLU590-M9DG 80GB | torch_mlu 1.31.1 | Qwen3-8B TP=1 | block_size=16 | num_layers=36 | num_kv_heads=8 | head_dim=128
+> 叠加优化: 优化1(fused_rms_norm) + 优化3(W8A16) + 优化4(KV cache int8)
+> 日期: 2026-08-23
+
+---
+
+# 1. 当前 INT8 KV Cache 实现
+
+通过 monkey-patch (`optimization_kvcache/kvcache_patch.py`) 注入, 原版 `attention.py` / `attention_mlu.py` / `model_runner.py` 一行不改。三个注入点:
+
+1. **`Attention.forward`** → `_patched_attention_forward`: 把 `k_scale/v_scale` 传给量化版 ops
+2. **`ModelRunner.allocate_kv_cache`** → `_patched_allocate_kv_cache`: 分配 int8 cache + fp32 scale, 挂到各层
+3. **store/decode/prefill attention** 用本模块量化版函数 (通过 forward 调用)
+
+| 路径 | 写入 | 读取 |
+|------|------|------|
+| store_kvcache | `quant_to_paged_cache` (bf16→int8+scale, 算子内部自动算 per-token scale) | — |
+| Decode | — | `single_query_cached_kv_attn(..., k_scale, v_scale, kv_cache_quant_bit_size=8)` 算子内部反量化 |
+| 普通 Prefill (block_tables=None) | 新算 bf16 K/V 直接走 `flash_attention` (不读 cache) | — |
+| Prefix HIT Prefill (block_tables≠None) | — | 只 gather 实际引用的 int8 blocks → MLU 反量化成 compact bf16 → remap block_tables → `flash_attention` |
+| CUDA fallback | `reshape_paged_cache` (bf16 直写) | `single_query_cached_kv_attn` (不传 scale) |
+
+**关键约束**: `flash_attention` 不支持读 int8 cache (要求 q/k dtype 一致, 见 `test_flash_int8.py` 的 `CNNL_STATUS_BAD_PARAM`), 故 prefix-cache prefill 必须先反量化成 bf16。
+
+# 2. KV / Scale Layout
+
+| 张量 | shape | dtype | 说明 |
+|------|-------|-------|------|
+| kv_cache | `(2, L, num_blocks, H, T, D)` = `(2, 36, B, 8, 16, 128)` | int8 | MLU layout: head 维在 block_size 前 |
+| kv_scales | `(2, L, num_blocks, H, T)` = `(2, 36, B, 8, 16)` | float32 | per-token-per-KV-head scale |
+| 单层 k_cache | `(num_blocks, 8, 16, 128)` | int8 | `module.k_cache = kv_cache[0, layer_id]` |
+| 单层 k_scale | `(num_blocks, 8, 16)` | float32 | `module.k_scale = kv_scales[0, layer_id]` |
+
+量化粒度: **per-token-per-KV-head** (scale shape 最后一维是 block_size=T, 即每个 token 一个 scale)。
+
+# 3. 容量预算修正
+
+**修正前 (问题 A)**: `block_bytes = 2*L*H*T*D*1` (只按 int8 本体 itemsize=1), 漏掉 FP32 scale → "容量严格 2.00x" 不严谨。
+
+**修正后** (`_patched_allocate_kv_cache`):
+```python
+int8_kv_bytes = 2 * L * T * H * D * 1        # int8 本体
+scale_bytes   = 2 * L * T * H * 4            # FP32 per-token scale
+block_bytes   = int8_kv_bytes + scale_bytes  # scale 纳入预算
+```
+
+| 分量 | bytes | MiB |
+|------|-------|-----|
+| bf16_block_bytes | 2×36×8×16×128×2 = 2,359,296 | 2.2500 |
+| int8_kv_bytes | 2×36×8×16×128×1 = 1,179,648 | 1.1250 |
+| scale_bytes (fp32) | 2×36×8×16×4 = 36,864 | 0.0352 |
+| **int8_total_block_bytes** | **1,216,512** | **1.1602** |
+| scale_overhead_ratio | 3.03% | |
+| **capacity_ratio** = bf16/int8_total | **1.9394x** | (非 2.00x) |
+
+# 4. 理论容量倍率
+
+**1.9394x** (非 2.00x)。FP32 scale 占每 block 3.03%, 吃掉部分容量收益。
+
+# 5. 真实容量倍率
+
+固定 KV budget (gpu_memory_utilization=0.9) 实测 (`test_budget.py` / `benchmark_capacity.py`, 真实模型加载):
+
+| mode | num_blocks | capacity_tokens | block_bytes | kv_payload_MB | scale_MB | total_kv_MB | model_fixed_GB | HBM_used_GB | peak_alloc_GB |
+|------|-----------|----------------|-------------|--------------|----------|-------------|----------------|-------------|---------------|
+| bf16 | 20,603 | 329,648 | 2,359,296 | 46,165 | 0 | 46,165 | 21.70 | 66.78 | 66.45 |
+| int8 | 39,958 | 639,328 | 1,216,512 | 44,767 | 1,399 | 46,166 | 21.70 | 66.78 | 66.45 |
+
+- **actual_capacity_ratio = 639,328 / 329,648 = 1.9394x**
+- 与理论 1.9394x **完全一致** (误差 < 0.01%)
+- 两种模式 total KV 显存几乎相同 (~46GB), int8 用同样显存装下 1.94x 的 block
+- model_fixed (权重+其它) 两种模式相同 (21.70GB), 证明差异只来自 KV budget
+
+**若仍为 2.00x**: 说明 scale 未纳入预算 (修正前的 bug)。修正后实测 = 1.94x, 与理论一致。
+
+# 6. Prefix Block Map stale cache 风险
+
+**修正前 (问题 B)**: 模块级全局 dict `_prefill_block_map_cache`, key = `(data_ptr, shape)`。
+- 风险: block_tables 张量 data_ptr 不变、shape 不变, 但内容被原地改写 → 旧 key 仍命中 → 返回基于旧内容的 mapping (stale)。
+- `test_block_map_cache.py` 复现: `[1,2,3,4]` 计算后原地改 `[1,2,3,9]`, data_ptr/shape 不变 → 旧实现返回 `[1,2,3,4]` (stale)。
+
+**确认 stale bug 存在** (修正前)。
+
+# 7. Context-Level Mapping Cache 修正
+
+**修正后** (`_compute_block_map`):
+1. 映射结果挂到 `context.kv_quant_block_map` (新增字段, 见 `nanovllm/utils/context.py`)
+2. `set_context()` 每次 forward 创建新 `Context` → `kv_quant_block_map=None`, 天然按 forward 失效
+3. 同一 forward 内 36 层 × 2(k/v) = 72 次调用复用同一映射, 只算一次
+4. **内容指纹校验**: key = `(data_ptr, shape, (首元素, 末元素, 非负元素数))`。data_ptr/shape 不变但内容变时, 采样点变化 → 失效重算, 修复 stale bug
+5. 计数器 `block_map_compute_count` 验证 "每 forward 只算一次"
+
+**验证结果** (`test_block_map_cache.py` 18/18 PASS):
+- 72 次调用只计算 1 次 ✓
+- 新 forward 重新计算 ✓
+- data_ptr 不变内容改变 → 重算 (无 stale) ✓
+- batch size 改变 → 重算 ✓
+- prefix length 改变 → 重算 ✓
+- -1 padding 正确处理 ✓
+- 随机离散 physical blocks 重映射到 [0,1,2,3] ✓
+
+**真机验证** (prefix-hit prefill): `block_map_compute_count` 在一次 prefix-hit prefill 前后 delta = **1** (每 forward 1 次, 不是 72 次)。
+
+# 8. Store Quantization
+
+`_patched_store_kvcache` → `ops.quant_to_paged_cache(k, v, k_cache, v_cache, k_scale, v_scale, slot_mapping)`:
+- 算子内部自动算 per-token scale = max(|k|)/127, 存 int8 + scale
+- 动态量化 (每写一个 token 量化一次), 无需离线校准
+- int8 range 实测 [-127, 127] ✓, scale finite & nonzero ✓ (`test_correctness.py`)
+
+# 9. Decode INT8 Attention
+
+`_patched_decode_attention` → `ops.single_query_cached_kv_attn(..., k_scale, v_scale, kv_cache_quant_bit_size=8)`:
+- **算子内部反量化**, 直接读 int8 cache, 无 host dequant
+- `test_kv_paths.py` 确认: decode 路径 KV 大数据不经过 CPU
+- 无 NaN/Inf, rel_err < 5% (见 §12)
+
+# 10. Cold Prefill
+
+普通 prefill (block_tables=None): 新算 bf16 K/V 直接走 `flash_attention`, **不读 cache, 不发生历史 KV dequant**。
+- int8 相对 bf16 的 prefill 开销: **0.4% ~ 6.9%** (quant store 成本, `quant_to_paged_cache` 比 `reshape_paged_cache` 稍贵)
+- 此路径无 dequant, peak memory 与 bf16 相同
+
+| prompt | bf16 prefill_ms | int8 prefill_ms | overhead |
+|--------|----------------|----------------|----------|
+| 512 | 60.07 | 59.80 | -0.4% |
+| 1024 | 97.22 | 103.48 | 6.4% |
+| 2048 | 190.45 | 203.59 | 6.9% |
+| 4096 | 393.21 | 417.66 | 6.2% |
+| 8192 | 862.19 | 909.37 | 5.5% |
+
+# 11. Prefix HIT Dequant Path
+
+`_patched_prefill_attention` (block_tables≠None, int8 路径):
+```
+block_tables → _compute_block_map (CPU unique+searchsorted, 每 forward 1 次)
+→ _dequant_used_blocks: index_select(used) + mul(scale) + cast(bf16)  [全在 MLU]
+→ compact bf16 KV + remapped block_tables
+→ flash_attention
+```
+
+**KV 大数据不经过 CPU** (`test_kv_paths.py`): 只 block_tables (int32, KB 级) / used ids / remapped bt 经过 CPU; int8 KV / scale / compact bf16 全在 MLU。`compact.device.type == "mlu"` ✓。
+
+**只反量化 used blocks** (`test_kv_paths.py`): compact_blocks == unique used blocks (4 == 4), 未反量化整个 cache (1000 blocks 只反量化 4)。dequant_bytes = 0.25MB (全 cache 反量化会 62.5MB)。
+
+**Block Remap Correctness** (`test_kv_paths.py`): 随机离散 physical blocks [7,21,35,80], 原 bf16+原bt vs INT8→compact+remapped_bt, attention 输出 max_abs_err=0.000366, rel_err=3.62% < 5% ✓。
+
+**Block Map CPU 开销** (`test_kv_paths.py`): 1~512 blocks, 各阶段 170~181µs (copy 40µs + unique 30µs + search 10µs + upload 96µs)。context cache 后每 forward 只算 1 次, 开销可忽略。
+
+# 12. Correctness
+
+**Level 1 单算子** (`test_correctness.py`, 75/75 PASS): ctx=16/64/256/1024/4096 × seed=0/1/2
+- 无 NaN/Inf ✓
+- scale finite & nonzero ✓
+- int8 range [-127, 127] ✓
+- **avg rel_err = 3.47%, max rel_err = 3.83%** (单层 decode attention, BF16 vs INT8)
+
+**Level 2 端到端** (`test_correctness.py`, 近 greedy temperature=0.01):
+- 注: nanovllm `SamplingParams` 禁止 temperature=0 (greedy), `Sampler` 用 `random_sample`。改用 temperature=0.01: logits/0.01 后 softmax 极度尖锐, random_sample 几乎必选 argmax, 接近 greedy。**这是低温 argmax-dominant 采样, 非严格 greedy**。
+- 5 个 prompt, 64 tokens:
+  - 平均 token match rate = **86.9%** (BF16 vs INT8)
+  - INT8 生成不崩, 全部有输出 ✓
+  - 个别 prompt (量子纠缠) 24 token 处发散 → match 37.5%, 其余 96.9%~100%
+
+# 13. Precision
+
+| ctx_len | max_abs_err | rel_err |
+|---------|-------------|---------|
+| 16 | 0.000732 | 3.67% |
+| 64 | 0.000366 | 3.71% |
+| 256 | 0.000183 | 3.80% |
+| 1024 | 0.000095 | 3.83% |
+| 4096 | 0.000046 | 3.66% |
+
+- attention relative error 稳定在 ~3.5% (per-token int8 量化的固有精度)
+- max_abs_err 随 ctx_len 增大而减小 (统计平均效应)
+- token match rate (近 greedy): 86.9%
+- 无 NaN/Inf
+
+# 14. Decode Benchmark
+
+batch=1/2/4/8, ctx=128~8192, output=32, repeat=3 (`benchmark_decode.py`):
+
+| batch | prompt | bf16 TPOT | int8 TPOT | speedup |
+|--------|--------|-----------|-----------|---------|
+| 1 | 128 | 9.81 | 10.00 | 0.981 |
+| 1 | 1024 | 10.08 | 10.31 | 0.978 |
+| 1 | 4096 | 10.92 | 10.71 | 1.019 |
+| 1 | 8192 | 54.24 | 55.69 | 0.974 |
+| 4 | 2048 | 12.50 | 12.47 | 1.003 |
+| 8 | 4096 | 14.92 | 14.20 | 1.051 |
+
+- **TPOT speedup = 0.97 ~ 1.05x, 基本持平** (int8 对 decode 延迟中性, 略有收益在高 batch/长 ctx)
+- 原因: decode attention 仅占 ~5% TPOT (主瓶颈是 GEMM 57% + RMSNorm 21%), int8 省的 KV 带宽不在主瓶颈上; 高 batch/长 ctx 时 KV 带宽占比上升, int8 略快
+- 8192 ctx: bf16 54.24ms vs int8 55.69ms (0.97x), decode 仍 memory-bound 但 attention 占比小
+- **int8 带宽节省未抵消 quant/dequant 成本** (decode 无 dequant, quant 在 store 时一次性, 影响小; TPOT 差异在噪声范围)
+
+# 15. Cold Prefill Benchmark
+
+见 §10。int8 prefill 开销 0.4~6.9% (quant store)。此路径无历史 KV dequant。
+
+# 16. Prefix HIT Benchmark
+
+prefix=512~8192, repeat=3 (`benchmark_prefix_hit.py`):
+
+| prefix | bf16 TTFT | int8 TTFT | ratio | dequant_ms | compact_bf16_MB | peak_GB |
+|--------|-----------|-----------|-------|------------|-----------------|---------|
+| 512 | 62.98 | 87.46 | 1.39x | 15.72 | 72.0 | 66.46 |
+| 1024 | 68.97 | 98.06 | 1.42x | 15.63 | 144.0 | 66.46 |
+| 2048 | 81.18 | 121.19 | 1.49x | 15.60 | 288.0 | 66.47 |
+| 4096 | 106.56 | 167.48 | 1.57x | 15.48 | 576.0 | 66.49 |
+| 8192 | 157.87 | 260.70 | 1.65x | 16.06 | 1152.0 | 66.53 |
+
+- **dequant_ms ~15-16ms 稳定** (一次 prefill 的 72 次 `_dequant_used_blocks`, index_select+mul+cast)
+- compact_bf16 随 prefix 线性增长: 72MB(512) → 1152MB(8192)
+- int8 TTFT 比 bf16 慢 1.39~1.65x (dequant 开销 + flash_attention 多一次 compact KV 读取)
+- blockmap_compute = 72 (k+v 各 36 层, 但经 context cache 只算 1 次 unique/searchsorted, 72 是 dequant 调用次数)
+
+# 17. Peak Memory
+
+**Prefix HIT Peak Memory** (重点测 compact BF16 临时 KV):
+
+| prefix | int8 cache MB | scale MB | temporary compact BF16 MB | peak allocated GB |
+|--------|--------------|---------|---------------------------|-------------------|
+| 512 | (per-block) | (per-block) | 72.0 | 66.46 |
+| 1024 | | | 144.0 | 66.46 |
+| 2048 | | | 288.0 | 66.47 |
+| 4096 | | | 576.0 | 66.49 |
+| 8192 | | | 1152.0 | 66.53 |
+
+- compact BF16 临时显存: 8192 prefix = **1.15GB** (峰值)
+- peak allocated 仅从 66.46 → 66.53GB (增加 0.07GB, compact 是瞬态分配/释放)
+- **长 Prefix 无明显 OOM 风险**: 8192 prefix 的 1.15GB compact 远低于可用预算 (~12GB available)
+- 即使 8192 prefix, peak < 66.6GB, 80GB 卡余量充足
+
+**全局 Peak** (decode/cold prefill): int8 与 bf16 峰值显存基本相同 (66.5~68.3GB), int8 优势在容量而非峰值。
+
+# 18. Effective Capacity
+
+固定 KV budget, 基于**修正后 budget**:
+
+| mode | max blocks | max tokens | actual ratio |
+|------|-----------|------------|--------------|
+| bf16 | 20,603 | 329,648 | 1.00x |
+| int8+fp32 scale | 39,958 | 639,328 | **1.9394x** |
+
+**最大并发能力** (KV-resident request 数, 只比 KV budget):
+
+| ctx/prefix | blocks/req | bf16 max_req | int8 max_req | ratio |
+|------------|-----------|--------------|--------------|-------|
+| 1024 | 65 | 316 | 614 | 1.94x |
+| 2048 | 129 | 159 | 309 | 1.94x |
+| 4096 | 257 | 80 | 155 | 1.94x |
+| 8192 | 513 | 40 | 77 | 1.93x |
+int8 在所有 ctx 下支持 ~1.94x 并发请求数。
+
+# 19. 当前瓶颈
+
+1. **Prefix HIT dequant 开销**: ~15ms / prefill (72 次 index_select+mul+cast), 导致 int8 prefix-hit TTFT 比 bf16 慢 1.39~1.65x。根因: `flash_attention` 不支持读 int8 cache, 必须反量化成 bf16。这是 **int8 KV 的主要性能代价**, 集中在 prefix-hit 路径。
+2. **compact BF16 临时显存**: 随 prefix 线性增长 (8192 → 1.15GB), 虽当前无 OOM, 但超长 prefix (16K+) 需关注。
+3. **Decode 收益小**: int8 对 TPOT 中性 (0.97~1.05x), 因 decode attention 仅占 ~5% TPOT, 不在主瓶颈。
+4. **容量收益是主要价值**: 1.94x 容量 → 1.94x 并发 / 更长上下文, 而非降延迟。
+
+# 20. 是否建议与 CPU L2 Offload 合并
+
+**建议: 具备进入 Quantized Hierarchical Prefix KV Cache 的条件, 但下一阶段必须专门约束/优化 Prefix HIT。**
+
+理由:
+- ✅ 容量预算修正完成 (scale 纳入, 1.94x 真实)
+- ✅ block-map stale 风险修复 (context 级 + 内容指纹)
+- ✅ 每 forward block map 只算 1 次
+- ✅ KV 大数据不经过 CPU
+- ✅ 三条路径 correctness 通过 (decode / cold prefill / prefix HIT)
+- ✅ random physical blocks remap 通过
+- ✅ 容量 1.94x, 并发 1.94x
+- ✅ decode 性能中性, peak memory 无 OOM 风险
+- ⚠️ Prefix HIT dequant 开销 ~15ms, TTFT 慢 1.39~1.65x (可接受但有优化空间)
+⚠️ Prefix HIT dequant 开销 ~15ms, TTFT 慢 1.39~1.65x (可接受但有优化空间)
+- ⚠️ compact BF16 临时显存随 prefix 增长 (8192=1.15GB, 当前安全)
+
+**下一阶段接口分析 (只分析, 不实施)**: 若 CPU L2 存 INT8+scale:
+- 4096 BF16 KV ≈ 576MB; INT8+FP32 scale ≈ 576/1.94 ≈ 297MB
+- CPU→MLU H2D 数据量理论接近减半 (1.94x)
+- 但 CPU L2 当前存的是 BF16 (kv_offload 主流程), 改成 INT8 需 CPU 端反量化或 MLU 端 pack, 复杂度上升
+- 本阶段不修改 CPU L2 Offload 主流程
+
+---
+
+# 最终必须回答的 14 个问题
+
+1. **INT8 block_bytes 是否已经计入 scale?**
+   是。修正后 `block_bytes = int8_kv_bytes + scale_bytes = 1,216,512` (含 FP32 scale)。
+
+2. **BF16 block / INT8 KV / scale 分别多少 bytes?**
+   - BF16 block = 2,359,296 bytes (2.25 MiB)
+   - INT8 KV = 1,179,648 bytes (1.125 MiB)
+   - scale (fp32) = 36,864 bytes (0.0352 MiB)
+
+3. **真实有效容量倍率是多少? 是否仍为 2.00x?**
+   **1.9394x, 不再是 2.00x**。实测 639,328/329,648 = 1.9394, 与理论完全一致。
+
+4. **FP32 scale 占每 block 比例多少?**
+   **3.03%** (36,864 / 1,216,512)。
+
+5. **FP16/BF16 scale 是否支持?**
+   **不支持**。`single_query_cached_kv_attn` 要求 `key_cache_quant_scale_desc_dtype == CNNL_DTYPE_FLOAT`, fp16/bf16 报 `CNNL_STATUS_BAD_PARAM`。正式 baseline 保持 FP32 scale。
+
+6. **data_ptr+shape map cache 是否存在 stale bug?**
+   修正前存在 (data_ptr/shape 不变内容变 → 返回旧 mapping)。**已修复**: 改用 context 级缓存 + 内容指纹 (首/末元素 + 非负数), 内容变化即失效重算。
+
+7. **Context-level cache 是否每 forward 只计算一次?**
+   是。`set_context()` 每次 forward 创建新 Context → `kv_quant_block_map=None` 自动失效; 同 forward 72 次调用复用, 真机实测 delta=1。
+
+8. **Decode 是否真正直接读 int8 cache、无 host dequant?**
+   是。`single_query_cached_kv_attn` 算子内部反量化, KV 不离开 MLU。`test_kv_paths.py` 确认 compact/used_ids/new_bt 均在 MLU。
+
+9. **Cold Prefill 的 quant store overhead 是多少?**
+   **0.4% ~ 6.9%** (512: -0.4%, 1024: 6.4%, 2048: 6.9%, 4096: 6.2%, 8192: 5.5%)。此路径无历史 KV dequant。
+
+10. **Prefix HIT 的 dequant latency / compact BF16 临时显存是多少?**
+    - dequant latency: **~15-16ms** (稳定, 72 次 index_select+mul+cast)
+    - compact BF16 临时显存: 72MB(512) → 1152MB(8192), 8192 时 1.15GB, peak 66.53GB (无 OOM)
+
+11. **512~8192 context 下 Decode TPOT 相比 BF16 如何?**
+    基本持平 (speedup 0.97~1.05x)。短 ctx/小 batch 略慢 (0.97x), 长 ctx/大 batch 略快 (1.05x)。8192: 54.24→55.69ms (0.97x)。int8 对 decode 延迟中性。
+
+12. **token match / attention error 如何?**
+    - attention relative error: avg 3.47%, max 3.83% (单算子)
+    - token match rate (近 greedy temp=0.01): 86.9% (5 prompt 平均)
+    - 无 NaN/Inf
+
+13. **INT8 Prefix HIT 是否存在明显 peak-memory/OOM 风险?**
+    **当前无明显风险**。8192 prefix compact BF16 = 1.15GB, peak 66.53GB (80GB 卡余量充足)。但 compact 随 prefix 线性增长, 超长 prefix (16K+) 需关注。
+
+14. **是否具备进入 Quantized Hierarchical Prefix KV Cache 的条件?**
+    **具备**。容量预算修正、block-map 生命周期、三条路径 correctness、容量 1.94x、peak memory 安全均已验证。Prefix HIT dequant 开销 (~15ms) 是已知限制, 下一阶段需专门优化 (如 flash_attention 支持 int8, 或流式 dequant)。
+
+ 最终裁决
+
+## **B. PASS WITH LIMITATION**
+
+**理由**:
+- Decode 和容量收益良好 (TPOT 中性 0.97~1.05x, 容量 1.94x, 并发 1.94x)
+- 三条路径 correctness 全通过, 无 NaN/Inf, attention error ~3.5%
+- 容量预算修正完成, block-map stale 修复, 每 forward 只算 1 次, KV 不经过 CPU
+- **但 Prefix HIT dequant/peak memory 有明显限制**: dequant ~15ms 导致 TTFT 慢 1.39~1.65x, compact BF16 随 prefix 线性增长 (8192=1.15GB)
+- **可以继续进入 Quantized Hierarchical Prefix KV Cache, 但下一阶段必须专门约束/优化 Prefix HIT** (流式 dequant / 限制 compact 大小 / 或推动 flash_attention 支持 int8)
+
+**停止条件全部满足**:
+- ✅ scale 纳入容量预算
+- ✅ 实际 capacity ratio 与理论一致 (1.9394x)
+- ✅ stale block-map 风险修复
+- ✅ 每 forward block map 只算一次
+- ✅ KV 大数据不经过 CPU
+- ✅ decode correctness PASS
+- ✅ cold prefill correctness PASS
+- ✅ prefix HIT correctness PASS
+- ✅ random physical blocks PASS
+- ✅ Decode 128~8192 benchmark 完成
+- ✅ Prefix HIT 512~8192 benchmark 完成
+- ✅ Peak MLU memory 有真实数据
+- ✅ token match / numerical error 有量化结果
+- ✅ 不修改 CPU L2 Offload 主流程
+
+**未实施 (按要求停止)**: CPU L2 INT8 / Quantized Offload / INT4 / ARC / Active KV Offload / CNRT C++ 优化
+
+# 交付物
+
+```
+optimization_kvcache/int8_validation/
+├── test_budget.py              # 容量预算 + peak memory (7/7 PASS)
+├── test_block_map_cache.py     # block map 生命周期 (18/18 PASS)
+├── test_correctness.py         # 单算子+端到端 (77/77 PASS)
+├── test_kv_paths.py            # KV 路径/remap/CPU 开销 (9/9 PASS)
+├── test_scale_dtype.py         # scale dtype 探测 (fp32 only)
+├── benchmark_decode.py         # decode benchmark
+├── benchmark_prefill.py        # cold prefill benchmark
+├── benchmark_prefix_hit.py     # prefix hit benchmark
+├── benchmark_capacity.py       # 容量+并发
+├── benchmark_workload.py       # 三类端到端 workload
+├── bench_harness.py            # 共享工具
+└── results/
+    ├── kvcache_int8_capacity.csv
+    ├── kvcache_int8_concurrency.csv
+    ├── kvcache_int8_decode.csv
+    ├── kvcache_int8_precision.csv
+    ├── kvcache_int8_prefill.csv
+    ├── kvcache_int8_prefix_hit.csv
+    └── kvcache_int8_workload.csv
+```
+
+**代码修改**:
+- `optimization_kvcache/kvcache_patch.py`: 修正 `_patched_allocate_kv_cache` (scale 纳入预算) + `_compute_block_map` (context 级缓存 + 内容指纹)
+- `nanovllm/utils/context.py`: `Context` 新增 `kv_quant_block_map` 字段
+

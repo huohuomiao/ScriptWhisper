@@ -1,0 +1,212 @@
+我已经把 attention 原版、model_runner、patch、测试脚本都读完了。下面给你一份精确到可直接复现的 KV cache int8 量化步骤，按"先理解数据结构 → 再分阶段操作 →
+  最后验证"组织。
+
+  第 0 步：先理清 KV cache 的数据结构（不搞清这个后面全乱）
+
+  nanovllm 用 paged KV cache——KV 不是连续存的，而是分成固定大小的"货架"（block），每个 block 存 block_size=16 个 token 的 KV。整个 cache 是一个大 tensor：
+
+  kv_cache: (2, num_layers, num_blocks, num_kv_heads, block_size, head_dim)
+             │   │           │           │             │           │
+             k/v │           货架编号     每货架16个token  每token的KV向量
+                 层(36)
+    dtype: 原 bf16 → 改 int8
+
+  scale:   (2, num_layers, num_blocks, num_kv_heads, block_size)
+           每个 token 的每个 KV head 一个 scale (per-token 量化)
+    dtype: fp32
+
+  每个 token 写入时，slot_mapping 告诉它"写到哪个货架的哪个槽位"。读的时候，block_tables 告诉它"这个请求的 KV 散落在哪些货架"。
+
+  关键：k_cache/v_cache 是按层切片挂到每个 Attention 层的——module.k_cache = self.kv_cache[0, layer_id]，所以每层看到的是 (num_blocks, num_kv_heads, block_size,
+  head_dim)。
+
+  第 1 步：分配 int8 cache + scale（替换 allocate_kv_cache）
+
+  原版分配 bf16，你改成 int8 + scale。核心改动只有 dtype 和新增 scale：
+
+  def allocate_kv_cache(self):
+      # ... 算 num_kvcache_blocks 的逻辑不变, 但 block_bytes 的 itemsize 从 2 改成 1
+      block_bytes = (2 * num_hidden_layers * block_size * num_kv_heads * head_dim * 1)  # int8 itemsize=1
+
+      # int8 cache (原 bf16)
+      self.kv_cache = torch.empty(cache_shape, dtype=torch.int8, device=self.device)
+       # 新增: per-token scale, 形状 (2, num_layers, num_blocks, num_kv_heads, block_size)
+      scale_shape = (num_kvcache_blocks, num_kv_heads, block_size)
+      self.kv_scales = torch.empty((2, num_layers, *scale_shape), dtype=torch.float32, device=self.device)
+
+      # 挂到每层: k_cache/v_cache + k_scale/v_scale
+      for module in self.model.modules():
+          if hasattr(module, "k_cache"):
+              module.k_cache = self.kv_cache[0, layer_id]
+              module.v_cache = self.kv_cache[1, layer_id]
+              module.k_scale = self.kv_scales[0, layer_id]   # 新增
+              module.v_scale = self.kv_scales[1, layer_id]   # 新增
+              layer_id += 1
+
+  容量收益就来自这里：itemsize 2→1，每块字节减半，同预算块数翻倍（2x）。
+
+  第 2 步：写入量化（替换 store_kvcache）
+
+  每生成一个 token，把新算出的 bf16 k/v 量化成 int8 写入 cache。量化是算子内部自动做的，你不用手写量化公式：
+
+  def store_kvcache(key, value, k_cache, v_cache, slot_mapping, k_scale, v_scale):
+      ops = torch_mlu_ops
+      if k_cache.dtype == torch.int8 and k_scale is not None:
+          # 算子内部: scale = max(|k_token|)/127, k_int8 = round(k/scale), 存 int8+scale
+          ops.quant_to_paged_cache(
+              key.contiguous(), value.contiguous(),
+              k_cache, v_cache, k_scale, v_scale,
+              slot_mapping.flatten(),
+          )
+      else:  # fallback bf16
+          ops.reshape_paged_cache(key.contiguous(), value.contiguous(),
+                                  k_cache, v_cache, slot_mapping.flatten())
+
+  对比原版：唯一区别是 reshape_paged_cache（bf16 直写）→ quant_to_paged_cache（int8 + scale），多传 k_scale/v_scale。
+
+  第 3 步：decode 读取（替换 decode_attention）—— 主路径，算子内部反量化
+  decode 时 1 个 query token 读全部历史 KV。single_query_cached_kv_attn 原生支持读 int8 cache，传 scale + kv_cache_quant_bit_size=8，算子内部边读边反量化：
+
+  def decode_attention(q, k_cache, v_cache, *, context_lens, block_tables,
+                       max_seqlen_k, scale, k_scale, v_scale):
+      query = q.contiguous().view(batch_size, 1, q.shape[1], q.shape[2])
+      output = torch.empty_like(query)
+      if k_cache.dtype == torch.int8 and k_scale is not None:
+          ops.single_query_cached_kv_attn(
+              query, k_cache, v_cache, output,
+              block_tables, context_lens,
+              k_scale, v_scale,        # ← 传 scale (原版传 None)
+              None,                    # alibi
+              max_seqlen_k, -1, -1, scale, False,
+              kv_cache_quant_bit_size=8,   # ← 关键: 告诉算子 cache 是 int8
+              head_size_v=-1, compute_dtype=torch.float32,
+          )
+      else:  # fallback
+          ...
+      return output.view_as(q)
+
+  这是 KV 量化的主受益路径，且不需要 host 侧反量化——算子片上完成。
+
+  第 4 步：prefill 读取—— 命中 prefix-cache 时必须 host 侧反量化
+
+  这是最复杂的一步，也是两个坑的来源。prefill 有两种情况：
+
+  情况 A：普通 prefill（block_tables=None）——不读 cache，k/v 是新算的 bf16，直接走 flash_attention，无需反量化。
+
+  情况 B：命中 prefix-cache（block_tables != None）——要从 int8 cache 读历史 KV，但 flash_attention 不支持读 int8（会报 CNNL_STATUS_BAD_PARAM），必须先反量化成 bf16。
+
+  反量化分两小步：
+
+  4a. 算"用到哪些 block"（unique/searchsorted，移 CPU + 缓存）
+   # 输入: block_tables (batch, max_blocks) int32, 8KB, 显存
+  # 输出: used_ids (去重排序的 block 编号), new_block_tables (重映射到紧凑 cache)
+
+  def _compute_block_map(block_tables):
+      key = (block_tables.data_ptr(), tuple(block_tables.shape))
+      if key in cache: return cache[key]   # 72次→1次 (所有层同一个 block_tables)
+
+      bt_cpu = block_tables.cpu().numpy()                          # 8KB 括到 CPU
+      used = np.unique(bt_cpu[bt_cpu >= 0]).astype(np.int32)       # CPU 去重排序
+      new_bt = bt_cpu.copy()
+      mask = new_bt >= 0
+      new_bt[mask] = np.searchsorted(used, new_bt[mask])          # CPU 重映射
+      used_ids = torch.from_numpy(used).to(block_tables.device)   # 括回显存
+      new_bt_mlu = torch.from_numpy(new_bt).to(block_tables.device)
+      cache[key] = (used_ids, new_bt_mlu)
+      return used_ids, new_bt_mlu
+
+  4b. 只反量化用到的 block（全程显存，MLU 算）
+
+  def _dequant_used_blocks(int8_cache, scale, block_tables):
+      used_ids, new_block_tables = _compute_block_map(block_tables)
+      # 全程显存: index_select 取出用到的 block, int8×scale→bf16
+      compact = (int8_cache.index_select(0, used_ids).float()
+                 * scale.index_select(0, used_ids).unsqueeze(-1)
+                ).to(torch.bfloat16)
+      return compact, new_block_tables   # compact bf16 cache + 重映射后的 block_tables
+
+  4c. 把紧凑 bf16 cache 喂给 flash_attention
+
+  def prefill_attention(q, k, v, *, ..., block_tables, k_scale, v_scale):
+      if block_tables is not None and k.dtype == torch.int8 and k_scale is not None:
+          k_compact, new_bt = _dequant_used_blocks(k, k_scale, block_tables)
+          v_compact, _ = _dequant_used_blocks(v, v_scale, block_tables)
+          k, v, block_tables = k_compact, v_compact, new_bt   # 替换成 bf16
+      # block_tables=None 时 k/v 已是 bf16, 直接走
+      ops.flash_attention(q, k, v, output, ..., block_tables, None,None,None,None, q.dtype)
+
+  第 5 步：Attention.forward 串起来（替换 Attention.forward）
+   把上面三步的量化版 ops 串进 forward，关键是把 k_scale/v_scale 从层属性传进去：
+
+  def attention_forward(self, q, k, v):
+      context = get_context()
+      if is_mlu(q):
+          k_cache, v_cache = self.k_cache, self.v_cache
+          k_scale, v_scale = getattr(self,"k_scale",None), getattr(self,"v_scale",None)
+          # 1. 写入: 量化版 store
+          if k_cache.numel() and v_cache.numel():
+              patched_store_kvcache(k, v, k_cache, v_cache, context.slot_mapping, k_scale, v_scale)
+          # 2. prefill: prefix-cache 路径要反量化
+          if context.is_prefill:
+              if context.block_tables is not None:   # prefix cache
+                  k, v = k_cache, v_cache             # 用 cache 当 k/v
+              return patched_prefill_attention(q, k, v, ..., block_tables=context.block_tables,
+                                                k_scale=k_scale, v_scale=v_scale)
+          # 3. decode: 算子内部反量化
+          return patched_decode_attention(q, k_cache, v_cache, ..., k_scale=k_scale, v_scale=v_scale)
+      return original_attention_forward(self, q, k, v)   # CUDA fallback
+
+  第 6 步：注入（monkey-patch）
+
+  原版文件一行不改，patch 两个类方法：
+
+  def apply_kvcache_quant_patch():
+      from nanovllm.layers.attention import Attention
+      from nanovllm.engine.model_runner import ModelRunner
+      # 幂等保护
+      if getattr(Attention.forward, "_kvcache_patched", False): return
+      Attention.forward = patched_attention_forward
+      ModelRunner.allocate_kv_cache = patched_allocate_kv_cache
+
+  第 7 步：验证（三层验证）
+   # 1. 端到端: 三优化叠加能生成通顺
+  python optimization_kvcache/test_correctness.py
+
+  # 2. 精度: KV int8 vs bf16 token 重合率 (单层 attention 相对误差 ~0.91%)
+  python optimization_kvcache/compare_precision.py
+
+  # 3. 容量: 同预算下 num_blocks 翻倍 (验证 2x 而非 1.76x)
+  python optimization_kvcache/diag_budget.py --bf16   # 20518 块
+  python optimization_kvcache/diag_budget.py --int8    # 41036 块 = 2.00x
+
+  # 4. 性能: TPOT 略增 +2%, 长上下文转正 -2%, KV 容量 2x
+  python optimization_kvcache/baseline_optimized.py --graph --batches 1,2,4,8 ...
+
+  复现时的关键决策清单（容易踩的坑）
+
+ ┌─────────────────────────────────┬──────────────────────────────────────────┬────────────────────────────────────────────────────────────┐
+  │             决策点              │                  怎么选                  │                           为什么                           │
+  ├─────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ 量化粒度                        │ per-token（每 token 每 head 一个 scale） │ MLU590 quant_to_paged_cache 内部就是 per-token，精度 0.91% │
+  ├─────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ 量化时机                        │ 动态（写入时算子内部算 scale）           │ 无需离线校准，每步实时                                     │
+  ├─────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ int8 vs fp8/int4                │ int8                                     │ fp8 本机不支持，int4 路径复杂                              │
+  ├─────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ prefill prefix-cache 反量化范围 │ 只反量化 block_tables 引用的 block       │ 反量化整个 cache 45GB→90GB 会 OOM                          │
+ ├─────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ unique/searchsorted 在哪算      │ CPU（numpy）+ 跨层缓存                   │ 8KB 数据, launch 开销 > 计算量; 72次→1次                   │
+  ├─────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ 反量化在哪算                    │ 显存（MLU）                              │ 100MB 数据, 必须用算子, 不能搬 CPU                         │
+  ├─────────────────────────────────┼──────────────────────────────────────────┼────────────────────────────────────────────────────────────┤
+  │ 哪些路径要反量化                │ 只有 prefill+prefix-cache                │ decode 算子内部反量化; 普通 prefill 不读 cache             │
+  └─────────────────────────────────┴──────────────────────────────────────────┴────────────────────────────────────────────────────────────┘
+
+一句话总结整个流程
+
+  写入时算子内部量化成 int8+scale 存显存（省一半显存）→ decode 时算子内部用 scale 反量化（主路径，无额外开销）→ prefill 命中 prefix-cache 时因 flash_attention 不支持读
+  int8，只在 host 侧把用到的 block 反量化成 bf16 再喂给它（罕见路径，要防 OOM 和 launch 开销放大）。 全程 KV cache 本体不离开显存，只有 8KB 的 block_tables 目录去过
+  CPU。
+
+  需要我把这套步骤整理成一份独立的复现文档（带完整可运行代码骨架），还是你想先聚焦其中某一步深入？
+

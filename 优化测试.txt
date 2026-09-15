@@ -1,0 +1,233 @@
+# Prefix Hash + CPU Block Mapping 独立 PoC 报告
+
+> **阶段**：Prefix KV Offload 第四步 —— Prefix Hash + CPU Prefix Index + hash→CPU block mapping
+> **环境**：MLU590-M9DG 80GB / torch_mlu 1.31.1+torch2.9.1 / Qwen3-8B bf16
+> **KV dtype**：bfloat16 · **block_size**：16 · **单 logical KV block**：≈2.25MB
+> **MLU KV layout**：`(2, 36, num_blocks, 8, 16, 128)` · **CPU Pool V2 layout**：`(num_cpu_blocks, 2, 36, 8, 16, 128)`
+> **日期**：2026-08-21
+> **结论**：✅ **PASS** —— 可进入 BlockManager / Scheduler 接入阶段
+
+---
+
+## 1. nanoLLM 现有 Prefix Hash 分析
+
+源码位置：`nanovllm/engine/block_manager.py`。
+
+```python
+@classmethod
+def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+    h = xxhash.xxh64()
+    if prefix != -1:
+        h.update(prefix.to_bytes(8, "little"))
+    h.update(np.array(token_ids).tobytes())
+    return h.intdigest()
+```
+
+回答 §二 的 10 个分析点：
+
+1. **nanoLLM 当前是否已有 Prefix Cache？** 是。`BlockManager.hash_to_block_id: dict[int,int]` 即 GPU/MLU 侧 prefix cache，key=block hash，value=physical block id。
+2. **hash 在哪里计算？** `BlockManager.compute_hash`（classmethod）+ `hash_blocks(seq)` 在调度时逐 block 调用。
+3. **hash 的输入是什么？** `(token_ids_of_block, prefix_hash)`。token_ids 以 `np.array(...).tobytes()` 喂入 xxh64。
+4. **是否包含 previous block hash？** 是。`prefix != -1` 时先 `h.update(prefix.to_bytes(8,"little"))`，即链式。
+5. **是否包含当前 block token ids？** 是。`h.update(np.array(token_ids).tobytes())`。
+6. **hash 类型？** `xxhash.xxh64().intdigest()` → 64-bit 无符号整数。
+7. **MLU/GPU 是否同一 hash？** 是。MLU 适配未改 BlockManager，GPU 与 MLU 共用同一 `compute_hash`。
+8. **block_size=16 如何进入 hash？** `Sequence.block(i)` 按 block_size 切出 16 个 token_ids，作为单次 `compute_hash` 的 token_ids 输入。block_size 决定每块 token 数，不直接进 hash 函数。
+9. **partial block 是否参与 prefix cache？** 不参与。`can_allocate`/`hash_blocks` 只对**完整 block**（`range(seq.num_blocks - 1)` / `start..end` 整块边界）计算 hash；最后未填满的 partial block 不入 `hash_to_block_id`。本 PoC 沿用同一语义：只索引完整 block。
+10. **request 的 block hash 列表保存在哪里？** nanoLLM 把 hash 存进 `Block.hash` 字段并登记到 `hash_to_block_id`；本 PoC 不依赖 Block 对象，由 `PrefixCacheBackend.hash_request` 显式生成 `list[int]` 链式 hash 供测试传入。
+
+**复用结论**：直接复用 `BlockManager.compute_hash`，**不另设计 hash**。
+
+## 2. Hash 语义与复用理由
+
+`test_prefix_hash.py` 10/10 PASS 验证三点语义：
+
+- **相同完整 prefix → 相同 hash**（确定性）：同一 token 序列两次链式计算结果一致。
+- **相同当前 block token、不同历史 → hash 不同**：block3 token 相同（seed 400），但前缀 `[1,2,3]` vs `[9,8,7]` 不同 → `ga[3] != gb[3]`。证明 hash 表达**完整 prefix**而非单块。
+- **某 token 改变 → 从该 block 起后续级联**：改 block1 第 1 个 token → block0 不变、block1 起全变；仅改末块 → 前 N-1 不变、末块变。
+
+语义即：`hash_i = H(hash_{i-1}, token_ids_of_block_i)`，与任务 §三 理想语义一致。
+
+**复用理由**：CPU prefix cache 必须与 MLU 侧 `BlockManager` 用同一 hash，否则 CPU 命中的块无法与 MLU `hash_to_block_id` 对应。复用 `compute_hash` 保证两侧 key 语义完全一致，CPU 层无需任何 hash 逻辑。
+
+## 3. CPUPrefixIndex 设计
+
+`cpu_prefix_index.py`，纯 Python dict 元数据层，**不依赖 MLU**：
+
+```python
+class CPUPrefixIndex:
+    self._table: dict[int, int] = {}   # block_hash -> cpu_block_id
+    ```
+
+接口：`insert / lookup / contains / remove / clear / __len__ / __contains__ / match_prefix`。
+
+**本阶段未加入**（严格遵守 §一 限制）：`last_access` / `access_count` / `ref_count` / `pending` / LRU links。第一版 dict 即可。
+
+## 4. hash → CPU block mapping
+
+- **key**：`block_hash`（int，`compute_hash` 返回的 xxh64）
+- **value**：`cpu_block_id`（int，CPUKVPoolV2 分配的块号）
+- **唯一性**：一个 hash 唯一对应一个 CPU block（shared prefix 只存一份，§十五）。
+- 与 nanoLLM `hash_to_block_id`（hash→**MLU** physical block id）同形，只是 value 域从 MLU block 换成 CPU block。
+
+## 5. Longest Prefix Lookup
+
+`match_prefix(block_hashes)` 顺序扫描，遇第一个 MISS（`self._table.get(h) is None`）**立即 break**：
+
+```python
+for h in block_hashes:
+    cid = self._table.get(h)
+    if cid is None:
+        break              # 第一个 MISS 即停
+    matched_hashes.append(h); matched_cpus.append(cid)
+```
+
+返回 `(matched_hashes, matched_cpus, matched_blocks)`。**不 sparse hit**：即使后续 hash 存在（如 `[A,B,C,D,E]` 中 D miss 但 E 存在），也因中间 MISS 截断，只返回 `[A,B,C]`。
+
+`test_cpu_prefix_index.py` 验证：`[A,B,C,D,E]`（D miss, E 存在）→ matched=3；prefix chain `A/B/C/D`→4、`A/B/C/X`→3、`A/B/Y`→2、`A/Z/C/D`→1（不跳 Z）。
+
+## 6. Duplicate Store
+
+两层去重：
+
+- **CPUPrefixIndex.insert**：hash 已存在 → 返回 `(False, existing_cpu_id)`，**不覆盖**。调用方拿到 `(False, existing)` 必须释放自己刚申请但未用的新 CPU block（防泄漏）。
+- **PrefixCacheBackend.store_blocks**：`new_idx = [i for i,h in enumerate(block_hashes) if h not in self.index]`，**只为未命中 hash 申请 CPU block**。已缓存 hash 直接跳过，不重复占 CPU。
+
+`test_prefix_cache_backend.py` 验证：store `[A,B,C]`（cpu_used=3）后再 store `[A,B,C,D]` → 只新增 D，cpu_used 3→4（非 3→7）。
+
+## 7. Store Commit 顺序
+
+严格 **先 Store 后 commit hash**（§十）：
+
+1. 去重找新块 `new_idx`
+2. `cpu_pool.allocate(len(new_idx))`（整批原子）
+3. `mover.store(new_mlu, new_cpu)` —— **D2H 搬 KV，唯一碰 CPU pool 的步骤**
+4. Store 成功后才 `index.insert(h, c)` commit hash
+
+**不能先 insert hash 再 copy KV**：若先写索引后搬运失败，索引会指向未填充的 CPU block（半成品）。当前顺序保证索引只指向已成功落盘的 KV。
+## 8. Capacity Failure / Rollback
+
+容量不足**整批 fail，不 partial store**（§十一）：
+
+```python
+try:
+    new_cpu = self.cpu_pool.allocate(len(new_idx))
+except RuntimeError:
+    return (False, {"reason": "insufficient_cpu_blocks"})
+```
+
+`CPUKVPoolV2.allocate` 是全或无：不够即 raise，已分配的 0 块（未分配任何），free-list 状态不变。返回 `success=False, reason="insufficient_cpu_blocks"`。
+
+**保证**：index 无半成品（len=0）、CPU block 无泄漏（cpu_used=0）、free-list 正确。**不实现 eviction**。
+
+`test_prefix_cache_backend.py` 验证：cap=1 store 2 块 → `success=False`、`reason=insufficient_cpu_blocks`、`index len=0`、`cpu_used=0`。
+
+## 9. Load Prefix
+
+`load_prefix(block_hashes, target_mlu_block_ids)`（§十二）：
+
+1. `match_prefix` 得 `(hashes, cpus, n)`
+2. `n > len(target)` → raise；否则 `tgt = target[:n]`
+3. 按 `split_contiguous_runs(cpus)` 拆连续 CPU 段，逐段 `mover.load(seg_cpu, seg_tgt)`（每段 contiguous H2D + device unpack）
+4. 返回 n
+
+**target_mlu_block_ids 由测试显式传入**，本阶段不调正式 BlockManager（§十三）。未来 Scheduler 接入时才负责 CPU HIT → allocate MLU physical blocks → load()。
+
+## 10. Physical Remapping Correctness
+
+store 到 MLU physical blocks `[src...]`，load 到**完全不同**的 `[dst...]`，验证 `read_blocks(dst) == read_blocks(src)` bit-exact。
+`test_prefix_cache_backend.py` 规模 1/4/16/64/128/256 全部 Physical Remap bit-exact PASS；§19 端到端：Request A store 6 块（src `[7,21,35,80,16,92]`），Request B 共享前 4，load 到 `[101,18,53,66]`，`read_blocks([101,18,53,66]) == read_blocks([7,21,35,80])` bit-exact PASS。
+
+证明 **CPU HIT 后能恢复到任意不同的 MLU physical blocks**（KV 内容与物理位置解耦）。
+
+## 11. Shared Prefix
+
+`A→block0, B→block1, C→block2`。Request1 `[A,B,C,D]` 与 Request2 `[A,B,C,X]` 共享 A/B/C，CPU 中只存一份（§十五）。
+
+由 `insert` 的不覆盖语义 + `store_blocks` 的去重保证：第二次 store `[A,B,C,X]` 时 A/B/C 已在索引 → `new_idx` 只含 X → 只申 1 个 CPU block。**不做 refcount**，只验证 metadata 不重复保存（`test_cpu_prefix_index.py` shared hash 二次 insert → `(False, 0)`，len 仍 1）。
+
+## 12. Remove / Clear
+
+- **`remove(block_hash)`**：`index.remove` 删 hash 并返回其 cpu_block_id → `cpu_pool.free([cpu])` 归还。不影响其他 hash。不存在返回 False。
+- **`clear()`**：`index.clear()` 清空并返回全部 cpu_block_id → `cpu_pool.free(cpus)` 全部归还。之后仍可重新 store/load。
+
+`test_prefix_cache_backend.py` 验证 remove 后 index 为空、lookup None；`test_cpu_prefix_index.py` 验证 clear 返回全部 cpu、len=0。
+
+## 13. Metadata 性能
+
+`benchmark_prefix_index.py`，每规模 10000 次 `match_prefix` 取 median（§二十一）：
+
+| num_blocks | store_full lookup (µs) | prefix_miss lookup (µs) |
+|---|---|---|
+| 1    | 0.50  | — |
+| 4    | 0.87  | 0.72 |
+| 16   | 2.44  | 1.56 |
+| 64   | 8.62  | 4.84 |
+| 128  | 17.79 | 9.45 |
+| 256  | 34.50 | 18.57 |
+
+- 256 块最坏 **34.5 µs**，远小于 KV Load 的 **ms 级**（V2 Load 256 blocks ≈29.8~33.2ms）。
+- 查找随块数线性（一次 dict get / block），16 块典型请求 ≈2.4µs。
+- **metadata lookup 比数据面搬运快 ~1000×，本层非 bottleneck**。
+
+## 14. 是否可以进入 BlockManager/Scheduler 接入阶段
+
+**可以。** 全部停止条件（§二十六）满足：
+
+| 停止条件 | 状态 |
+|---|---|
+| nanoLLM 现有 Prefix Hash 已确认 | ✅ `BlockManager.compute_hash`（xxh64 链式） |
+| CPU Index key 语义明确 | ✅ hash→cpu_block_id，与 MLU 侧同 hash |
+| hash→cpu_block_id 正确 | ✅ 27/27 元数据测试 |
+| longest contiguous prefix lookup 正确 | ✅ 遇 MISS 即停，不 sparse |
+| duplicate store 不重复占 CPU | ✅ 只新增未缓存块 |
+| capacity 不足无 partial corruption | ✅ 整批 fail + rollback，无泄漏 |
+| remove/clear 正确 | ✅ 归还 CPU blocks |
+| arbitrary MLU physical remapping bit-exact | ✅ 1/4/16/64/128/256 全 PASS |
+| metadata lookup ≪ KV load latency | ✅ 34.5µs vs ~30ms |
+| 不修改 Scheduler/generation/Attention 主逻辑 | ✅ 全部独立 PoC，零侵入 |
+
+**未做（严格遵守限制）**：Scheduler/BlockManager integration、num_computed_tokens 修改、真实 Prefix HIT、LRU、Async、refcount/pending。
+
+---
+
+## §二十四 最终 10 问回答
+
+1. **nanoLLM 当前 block hash 在哪里生成？** `nanovllm/engine/block_manager.py:BlockManager.compute_hash`（classmethod），`hash_blocks(seq)` 在调度时逐块调用。
+2. **CPU Prefix Cache 是否直接复用了当前 hash？** 是。`PrefixCacheBackend.compute_hash` 直接转发 `BlockManager.compute_hash`，未另设计。
+3. **hash 是否表达完整 Prefix，而不只是当前 block token？** 是。链式 `H(hash_{i-1}, token_ids_i)`，前缀不同则当前块 hash 不同（test_prefix_hash 验证）。
+4. **CPUPrefixIndex key/value 分别是什么？** key=block_hash(int xxh64)，value=cpu_block_id(int)。
+5. **Longest Prefix Lookup 如何保证遇第一个 MISS 就停？** 顺序 for 循环，`self._table.get(h) is None` 即 `break`，不收集后续。
+6. **Duplicate Store 是否避免重复占 CPU blocks？** 是。`store_blocks` 只为 `h not in index` 的块 allocate，已缓存跳过。
+7. **Store 失败是否不会留下无效 hash / block 泄漏？** 是。先 Store 后 commit；容量不足整批 fail，allocate 全或无，index 无半成品、free-list 无泄漏。
+8. **CPU HIT 后是否能恢复到完全不同的 MLU physical blocks？** 是。Physical Remap bit-exact 全规模 PASS，KV 内容与物理位置解耦。
+9. **Prefix metadata lookup 开销是多少？** 1 block 0.5µs，256 blocks 34.5µs（median），远小于 KV load ms 级。
+10. **当前是否具备进入 BlockManager/Scheduler integration 的条件？** 是。元数据层完整正确，可作为 Step 5 底座。
+---
+
+## §二十五 最终结论
+
+# ✅ A. PASS
+
+Prefix Hash + CPU block mapping 完整正确；longest-prefix lookup / duplicate store / rollback / physical remapping 全 PASS；metadata lookup 34.5µs ≪ KV load ~30ms。**可进入 BlockManager/Scheduler 接入阶段。**
+
+> 真正 offload 性价比主线仍是 Step 2 的 host 搬运带宽（0.7–1.2GB/s 瓶颈）。本步只确认「前缀命中可被廉价定位」，不代表 offload 划算 —— Step 5 接真实 Scheduler 后仍以 host 带宽为决策主线。
+
+---
+
+## 生成物
+
+```
+kv_offload_poc/prefix_index/
+    cpu_prefix_index.py             CPUPrefixIndex（hash→cpu_block_id + longest-prefix）
+    prefix_cache_backend.py         PrefixCacheBackend（store/lookup/load/remove/clear）
+    test_prefix_hash.py             10/10 PASS
+    test_cpu_prefix_index.py        27/27 PASS
+    test_prefix_cache_backend.py    57/57 PASS（含 Physical Remap bit-exact）
+    benchmark_prefix_index.py       metadata lookup 计时
+    results/
+        prefix_index_cases.csv      测量结果
+        prefix_index_report.md      本报告
+```
+
+

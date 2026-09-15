@@ -1,0 +1,421 @@
+# Async Load + LOAD_PENDING + CPU Block Refcount + Scheduler 非阻塞等待 —— 第八步报告
+
+> 阶段：Prefix KV Offload 第八步（只异步化 Load：CPU→MLU H2D）
+> 环境：MLU590-M9DG 80GB / torch_mlu 1.31.1 / Qwen3-8B / KV dtype bfloat16 / block_size=16
+> MLU KV layout `(2,36,N,8,16,128)` = (KV,Layer,Block,Head,Tok,Dim)；CPU Pool V2 block-major `(N,2,36,8,16,128)`；单 logical KV block ≈ 2.25MB
+> 交付物：`kv_offload_poc/prefix_index/cpu_prefix_index.py`（refcount）、`kv_offload_poc/prefix_index/prefix_cache_backend.py`（AsyncLoadJob/StagingPool/submit/poll）、`kv_offload_poc/layout_v2/kv_block_mover_v2.py`（submit_load_async）、`nanovllm/engine/block_manager.py`（reserve/commit split）、`nanovllm/engine/scheduler.py`（LOAD_PENDING + 非阻塞）、`nanovllm/engine/llm_engine.py`（poll 接入）、`nanovllm/config.py`（开关）、`kv_offload_integration/test_async_load.py`（测试）、`kv_offload_integration/async_load_benchmark.csv`（基准）、本报告
+
+---
+
+## 1. 同步 Load 当前瓶颈
+
+第七步结束时，Store 已异步化（visible 20.69ms → 3.70ms），但 **Load 仍是同步**：CPU Prefix HIT 时，Scheduler 在 `_cpu_lookup_and_load` 里同步 `load_prefix`（CPU KV → MLU H2D + unpack）+ `torch.mlu.synchronize()`，整段 ~25ms（@4096）**阻塞在 schedule() 关键路径上**。
+
+后果是 Head-of-Line Blocking：当队首请求 A 是 CPU HIT（需 ~25ms load），其后已就绪的请求 B（cold / L1-hit compute）必须等 A 的 load 完成才能进入 batch。25ms 的 load 把整个 schedule 卡住，与后续 compute 串行，无法重叠。
+
+## 2. Async Load 总体架构
+
+把 Load 拆成 **reserve → async submit → LOAD_PENDING → poll → commit**，只异步化 H2D+unpack：
+
+```
+CPU HIT
+→ L2 lookup (cpu_ids)
+→ acquire CPU refs (ref_count +1, 防 H2D 期间被 LRU 淘汰)
+→ reserve MLU target blocks (allocate_prefix set_cached_tokens=False: 写 block_table, 不设 num_cached_tokens)
+→ acquire load staging slot (独占)
+→ transfer_stream 异步 H2D (CPU→staging) + device unpack (staging→MLU native)   (non_blocking)
+→ record Event AFTER unpack
+→ LOAD_PENDING (seq 移出 waiting/running, 不 forward)
+→ Scheduler 继续处理其他 ready seq (不阻塞)
+→ 下一 step poll (event.query non-blocking)
+→ Event complete → commit (complete_cpu_prefix_load: 注册 hash + 设 num_cached_tokens) + release refs/staging
+→ seq 回 waiting 头部, 后续 step 正常 prefill suffix
+```
+
+关键点：**Event 记录在 unpack 之后**（不是仅 H2D 之后）；**CPU refs 在 submit 前 acquire、Event complete 后 release**；**num_cached_tokens 只在 Event complete 后才更新**；**LOAD_PENDING seq 绝不进 ModelRunner forward**。Scheduler 不等待——其他 ready Sequence 在 load 在途时继续被调度。
+
+## 3. LOAD_PENDING 状态
+
+新增逻辑状态 `LOAD_PENDING`，与 `READY`/`STORE_PENDING` 分离：
+
+| 状态 | 含义 | seq 位置 | 可 forward |
+|---|---|---|---|
+| WAITING (正常) | 待调度 | waiting 队列 | 是 |
+| LOAD_PENDING | H2D+unpack 在途, Event 未完成 | pending_load_sequences | **否** |
+| (complete) | Event done, 已 commit | 回 waiting 头部 | 是 |
+
+- `pending_loads: dict[seq_id, AsyncLoadJob]`：LOAD_PENDING seq 的 job（Scheduler 持有）。
+- `pending_load_sequences: deque[Sequence]`：LOAD_PENDING seq 暂存（保持入队顺序，基本公平）。
+- `is_finished()` 扩展：`not waiting and not running and not pending_load_sequences`——pending load 未完成时引擎不算结束。
+- LOAD_PENDING seq **不在 waiting/running**，`schedule()` 的 prefill/decode 循环都遍历不到它，因此**绝不进入 ModelRunner forward**（§三十一）。
+
+## 4. Reserve / Commit 分离
+
+异步 Load 的核心难点：reserve（提交时）与 commit（Event 完成时）必须分离，否则 seq 会在 KV 未就绪时被 forward。
+
+- **reserve**：`allocate_prefix(seq, l1_hit, l2_hit, set_cached_tokens=False)`——分配 L1 命中块 + L2 占位块 + suffix 块，**写 block_table**（MLU physical blocks 已 reserve），但**不设 `num_cached_tokens`**（保持 0），**不注册 `hash_to_block_id`**（L2 占位块 hash=-1）。
+- **commit**：`complete_cpu_prefix_load(seq, total_cached_blocks, l2_block_ids, l2_hashes, l2_token_blocks)`——Event complete 后调用：`commit_cpu_hit`（注册 hash→block_id，promote L2→L1）+ 设 `num_cached_tokens = total_cached_blocks * block_size`。
+
+为何安全：`num_cached_tokens=0` 意味着即便 seq 误入 schedule，`num_tokens = num_tokens - 0*block_size = num_tokens`（全量 prefill），但 seq 被 Scheduler 持有在 `pending_load_sequences`，schedule 的 prefill 循环 `while self.waiting` 遍历不到它，**双重保险**：既不在 waiting，又 num_cached_tokens=0 不可部分 prefill。只有 commit 后 seq 回 waiting、num_cached_tokens 已设，才走正常 suffix prefill。
+
+## 5. CPU Block Refcount 保护
+
+H2D 在 `transfer_stream` 异步执行，期间源 CPU blocks 必须不被 LRU 淘汰（否则 H2D 读到被覆盖/复用的数据）。引入 CPU block refcount（`cpu_prefix_index.py`）：
+
+- `self._ref: dict[cpu_block_id, int]`：每个 READY CPU block 的 in-flight async load 消费者计数。
+- `acquire_refs(cpu_block_ids)`：submit 前 +1（§六/§十五）。
+- `release_refs(cpu_block_ids)`：Event complete/fail 后 -1，**减到 0 删除 entry，绝不为负**（double-release 防护：cid 不在 `_ref` 则忽略）。
+- `ref_count(cid)` / `num_protected()` / `peak_refcount()`：诊断/测试用。
+- `pop_lru_evictable()`：扫描 LRU 端，**跳过 ref>0 的 protected entry**，删除第一个 ref==0 的。原 `pop_lru()` 保留向后兼容（无 refcount 检查）。
+
+保护语义：ref>0 = 有 in-flight async load 正在读该 CPU block，**不可被 LRU 淘汰**（§八）。只有 ref归 0 后才可淘汰。
+
+## 6. Load Staging Pool
+
+`AsyncLoadStagingPool`（与 `AsyncStoreStagingPool` 同构，独立实例）：预分配 `max_pending`（默认 2）个独立 MLU contiguous staging slot，layout `(capacity_blocks, 2, 36, 8, 16, 128)`。
+
+- 初始化时一次性 `torch.empty`，热路径不再 malloc 大 tensor。
+- 每个 slot 状态 `FREE/BUSY` + `owner_job_id`；一个 pending load job 独占一个 slot，Event 完成前不可复用。
+- 默认 `capacity_blocks=320`（5120 tokens，覆盖 4096 prefix）。超过单 slot 容量 → fallback 同步（`too_large`，§十一），不实现 chunked async load。
+- 显存占用：`max_pending × capacity_blocks × 2.25MB`。本配置 2×320×2.25MB ≈ **1.44GB**（benchmark 日志确认 `load_staging_mem=1440.0MB`）。
+
+## 7. MLU Target Block 预留
+
+reserve 时 `allocate_prefix(set_cached_tokens=False)` 为 L2 命中块分配 MLU physical blocks（`_allocate_block`，ref_count=1, hash=-1），写入 `seq.block_table`。这些块此刻：
+- 不在 `free_block_ids`（已被占）；
+- 不在 `hash_to_block_id`（hash=-1，未注册）；
+- 由 seq 独占，Event complete 后 commit 才注册 hash；fail/cancel 时 `rollback_cpu_hit` 释放回 free。
+
+这保证 H2D+unpack 写入的目标 MLU 块在 Event 完成前不会被其他 seq 复用（独占），且 commit 后才对 L1 可见（避免其他 seq 误读未就绪 KV）。
+
+## 8. Submit Load 流程
+
+`submit_load(block_hashes, cpu_block_ids, target_mlu_block_ids, l1_hit_blocks, l2_token_blocks, request_id, unpack_method) -> (ok, result)`（§四/§十四/§十六）：
+
+1. `too_large`：n > max_blocks → fallback 同步（记 `sync_fallback_too_large`）。
+2. `acquire load staging slot`：全 BUSY → fallback 同步（记 `sync_fallback_busy`）。
+3. 异步 H2D + device unpack + record Event：`mover.submit_load_async(staging, cpu_ids, mlu_ids, unpack_method)` 在 `transfer_stream`，non_blocking。
+4. 创建 `AsyncLoadJob(state=LOAD_PENDING)`，入 `pending_load_jobs`。
+
+前置（调用方 Scheduler 已完成）：L2 lookup HIT、reserve MLU target、acquire CPU refs。本方法只在 fail 时 release staging slot（不 release refs——调用方 rollback 释放）。
+
+返回 `ok=True`：`{job_id, num_blocks, reason="submitted", submit_us, slot_id}`。`ok=False`：`{reason ∈ {too_large, staging_busy, load_io_failure}}`。
+
+## 9. Event 位置（record AFTER unpack）
+`submit_load_async`（`kv_block_mover_v2.py`）的关键（§十四）：
+
+```python
+with torch.mlu.stream(self.transfer_stream):
+    for start_idx, run_cpu_id, run_len in _contiguous_runs(cpu_block_ids):
+        cpu_seg = self._cpu_contig_seg(seg_cpu)       # 直读连续 CPU 池
+        staging[start_idx:start_idx+run_len].copy_(cpu_seg, non_blocking=True)  # H2D
+    self.unpack(staging, list(mlu_block_ids), unpack_method)  # staging -> MLU native
+    ev = torch.mlu.Event(enable_timing=True)
+    ev.record()   # AFTER unpack, 不是仅 H2D 后
+return ev
+```
+
+Event 必须记录在 **unpack 完成**之后（MLU native KV 已 scatter 回写），而非仅 H2D 完成后——否则 commit 时 MLU KV 尚未 scatter 到 native layout，forward 会读到未初始化数据。H2D 只把数据搬到 staging（block-major），unpack 才把 staging scatter 到 MLU native `(2,36,N,8,16,128)`。两段都在 `transfer_stream`，顺序依赖，Event 在末尾记录一次即可覆盖两者。
+
+## 10. Event Polling
+
+`poll_load_completions()`（§十八）：遍历 `pending_loads`，`job.event.query()` **非阻塞**判断 H2D+unpack 是否完成。**绝不 `event.synchronize()`**（否则又变同步）。
+
+放置位置：`LLMEngine.step()` 在 `schedule()` **之前**调用 `self.scheduler.poll_load_completions()`（`llm_engine.py:116`）。理由（§十八）：完成的 load 可在本 step 立即 commit + 恢复调度，减少额外一轮 latency；非阻塞 query；不依赖 background thread。
+
+Scheduler 侧 `poll_load_completions` 逐个 query，完成的调 `_complete_pending_load`（commit + release + seq 回 waiting），失败的调 `_fail_pending_load`（rollback + seq 回 waiting 走原 prefill）。backend 侧 `poll_load_completions` 只释放 staging/refs + 从 `pending_load_jobs` 删除，**不 commit**（commit 需操作 BlockManager/seq，backend 不持有）。
+
+## 11. Load Completion Commit
+
+`_complete_pending_load(seq_id, job)`（§十九），**仅在 Event 已完成后**：
+
+1. 找到 `pending_load_sequences` 中对应 seq。
+2. 若 `job.cancelled`（§二十三）：`_complete_load_job` 释放 refs/staging（不计 completed）+ `rollback_cpu_hit` 释放 target MLU blocks + 清 block_table + 不 commit + 不重新入队 + `cancelled += 1`。
+3. 否则：`complete_cpu_prefix_load`（commit_cpu_hit 注册 hash + 设 num_cached_tokens）+ `_complete_load_job`（release staging + release refs + 从 pending 删除 + `completed += 1`）。
+4. seq 回 `waiting.appendleft`（保持基本公平，§十七）。
+
+**绝不提前 commit**——num_cached_tokens 只在 Event complete 后才生效（§三十二）。
+
+## 12. Load Failure Rollback
+
+两类失败（§二十一/§二十二）：
+
+- **submit 侧 IO 异常**（`submit_load_async` 抛）：`submit_load` 捕获 → release staging slot + `failed += 1`，返回 `load_io_failure`。Scheduler 侧 `_try_async_cpu_load` 释放 CPU refs + `rollback_cpu_hit` 释放 target blocks + 清 block_table + fallback 原路径。
+- **Event query 异常**：`poll_load_completions` 捕获 → `_fail_load_job`（release staging + release refs + `failed += 1`）。Scheduler 侧 `_fail_pending_load`：`rollback_cpu_hit` + 清 block_table + num_cached_tokens=0 + seq 回 waiting 走原 prefill（不 commit）。
+
+`test_failure_rollback`（§34）注入 H2D submit 异常与 Event query 异常两路，验证 pending 清理、CPU refs 归 0、staging slot FREE、target blocks 释放、invariant 正确、Scheduler 不崩。
+
+> 限制：torch_mlu Event 无法区分"异步 copy 完成"与"runtime failure"，query 异常按失败处理；但 Python/submit 侧异常 rollback 完整。
+
+## 13. Cancel / Abort
+`cancel_load_job(job)`（§二十三）：Request abort/cancel 时标记 `job.cancelled=True`、`state=LOAD_CANCELLED`，**不立即 free target MLU blocks**（load stream 可能还在写）。Event 完成后 `_complete_pending_load` 检查 cancelled：释放 refs/staging + `rollback_cpu_hit` free target blocks + 不 commit + 不重新入队。避免在 H2D 仍在写 target blocks 时释放它们导致竞争。
+
+## 14. Protected Eviction / LRU 交互
+
+Async Load 启用时，`_evict_lru` 改用 `pop_lru_evictable`（跳过 ref>0）。LRU victim 只能来自 ref==0 的 READY entry（§八）。
+
+容量检查（Store 侧）：`free + evictable_ready < num_new` → skip `insufficient_cpu_blocks`。不能淘汰 protected（in-flight load 正读）的 CPU block。
+
+`test_protected_eviction`（§29）两场景：
+- 场景1：cap=6，READY 4 块（A/B/C/D，free=2），acquire A/B（protected）。store 4 新块需淘汰 2 → `pop_lru_evictable` 跳过 A/B，只淘汰 C/D。验证 A/B 仍在、C/D 已淘汰、A/B 仍 protected。
+- 场景2：cap=4，全满（free=0），全 protected。store 1 新块需淘汰 1 但无 evictable victim → skip `insufficient_cpu_blocks`，原 4 块仍在。
+
+## 15. Capacity Invariant
+
+异步 Load 不新增 CPU block 占用（load 读 READY，不 allocate CPU block），但 refcount 引入 protected 概念。`invariant_ok()` 扩展校验：`ref_count >= 0`（无负 ref）。原有校验（free+ready+pending==capacity、ready/pending 不重叠、hash 不重叠）继续成立。
+
+CPU block 生命周期不变：READY block 被 acquire ref 后仍在 ready LRU（只是 protected 不可淘汰），release 归 0 后恢复可淘汰。不引入新 CPU block 状态。
+
+## 16. Pending Sequence 不 forward
+
+LOAD_PENDING seq 的三重保护（§三十一）：
+1. **不在 waiting/running**：schedule 的 prefill 循环 `while self.waiting` 和 decode 循环 `while self.running` 都遍历不到它。
+2. **num_cached_tokens=0**：reserve 不设，commit 才设。即便误入 schedule，`num_tokens = num_tokens - 0` = 全量，不会部分 prefill。
+3. **Scheduler 持有引用**：seq 在 `pending_load_sequences`，commit 后才移到 `waiting.appendleft`。
+`test_real_request_load_pending`（§36）验证：CPU HIT 请求进 LOAD_PENDING，期间不 forward，Event complete 后 commit + 回 waiting + suffix prefill，输出与同步路径 exact match。
+
+## 17. Scheduler 非阻塞调度
+
+`schedule()` 的 prefill 循环（§十六）：当 `async_load` 启用且 seq 是 CPU HIT，调 `_try_async_cpu_load`：
+- `ok=True`（LOAD_PENDING）：`waiting.popleft()` + `pending_load_sequences.append(seq)` + `continue`——**继续处理下一个 waiting seq，不阻塞**。
+- `ok=False, l2_hit>0`（同步 fallback 完成）：`num_cached_blocks += l2_hit`，seq 留 waiting 走正常 prefill。
+- `ok=False, l2_hit==0`（L2 MISS 或失败）：走下方原路径。
+
+空 batch 处理：当所有 seq 都在 LOAD_PENDING，schedule 返回空 batch。`step()` 检测 `if not seqs:` → `poll_store_completions()` + `return [], 0`（不调 model_runner，避免 `assert scheduled_seqs` 失败）。下一 step 的 poll 会把完成的 load 移回 waiting。
+
+decode 路径 `assert scheduled_seqs or self.pending_load_sequences`：pending load 存在时允许空 scheduled_seqs（非死锁，后续 poll 会推进）。
+
+## 18. Sync Fallback
+
+三类 async 不可用情况，Scheduler fallback 同步 Load（§十一/§十二）：
+
+| reason | 触发 | 处理 | metric |
+|---|---|---|---|
+| `too_large` | n > max_blocks (320) | release refs + 同步 `load_prefix` + `complete_cpu_prefix_load` | `sync_fallback_too_large` |
+| `staging_busy` | max_pending=2 slot 全占 | release refs + 同步 Load + commit | `sync_fallback_busy` |
+| `load_io_failure` | H2D submit 异常 | release refs + `rollback_cpu_hit` + 走原 prefill | `failed` |
+同步 fallback 复用已 reserve 的 `l2_block_ids`（block_table 已写），不重复分配。fallback 后 seq 留 waiting 走正常 prefill（与同步路径一致）。
+
+`test_staging_ownership`（§31）验证：A/B 占满 2 slot，C → `staging_busy` fallback（`sync_fallback_busy +1`），A 完成后 C 再 submit 成功。
+
+## 19. Concurrent Shared Prefix Load
+
+同一 CPU prefix 被多个 Request 同时命中时，refcount 共享（§三十）：
+
+```
+Request A acquire  -> ref 0→1
+Request B acquire  -> ref 1→2  (shared, peak_refcount=2)
+A/B 各自 submit (不同 target MLU blocks, 各占一个 staging slot)
+poll: A complete -> ref 2→1; B complete -> ref 1→0
+```
+
+两个 job 用**不同 target MLU blocks**（各自 reserve），但读**同一 CPU source blocks**（refcount 共享保护）。H2D 期间 CPU blocks 被 ref>0 保护，不可淘汰。两个 load 完成后 ref 归 0，恢复可淘汰。
+
+`test_concurrent_shared_load`（§30）验证：A/B 都 submit ok、pending=2、ref=2 期间 protected、poll 后 ref 全 0、A/B 各自 bit-exact（无 staging 互相覆盖）。
+
+## 20. Async Store + Async Load 共存
+
+Store（D2H，`transfer_stream`）与 Load（H2D，`transfer_stream`）共用同一 transfer stream，但 staging pool 独立（`staging_pool` vs `load_staging_pool`），job 队列独立（`pending_jobs` vs `pending_load_jobs`），poll 独立（`poll_store_completions` vs `poll_load_completions`）。
+
+`test_store_load_coexist`（§39）：B finish 触发 async store（D2H pending），同时 C CPU HIT 触发 async load（H2D），两者并存。验证 C CPU HIT async、A vs C 输出 exact match、最终 pending_store=0、pending_load=0、invariant_ok。Store 与 Load 在同一 transfer stream 上顺序执行（不并行），但都与默认流 compute 重叠，不冲突。
+
+## 21. Flush / Clear / Shutdown
+
+- `flush_pending_loads(timeout)`（§二十四）：同步等待全部 pending Load Event 完成（允许 `event.synchronize()`），用于 shutdown / test teardown / L1 reset 前。Scheduler 侧 `flush_pending_loads` 逐个 poll 完成 commit，超时剩余标失败。
+- `flush_pending_io(timeout)`：同时 flush Store + Load。
+- `clear/reset` 前必须先 flush（§二十四）：不能 H2D 还在写时 reset/free。
+- `disable_async_load` 先 flush 再置空。
+- `LLMEngine.step()` 空 batch 时仍调 `poll_store_completions()`（§二十四），保证无请求时 store 也能收尾。
+
+## 22. Correctness Tests
+
+`test_async_load.py` **102 passed, 0 failed**，覆盖 §27–§41：
+
+| 节 | 测试 | 结果 |
+|---|---|---|
+| §27 | 基础 LOAD_PENDING 状态机 submit→pending→poll→commit→bit-exact | PASS |
+| §28 | CPU Refcount: acquire/release/double-acquire/double-release 防护 | PASS |
+| §29 | Protected Eviction: ref>0 不可淘汰, 全 protected → skip insufficient | PASS |
+| §30 | Concurrent Shared Load: ref 0→1→2→1→0, A/B bit-exact | PASS |
+| §31 | Staging Ownership: max_pending=2, C fallback busy, A 完成后 C 成功 | PASS |
+| §34 | Failure Rollback: H2D submit 异常 / Event query 异常 | PASS |
+| §35 | 原有回归: 同步 store/load/lookup + async store 不破坏 | PASS |
+| §36 | 真实 Request LOAD_PENDING (LLM): CPU HIT→async→suffix prefill, exact match | PASS |
+| §37 | Cold vs CPU HIT async: 输出 exact match | PASS |
+| §38 | 多个同时 CPU HIT (4 Request, max_pending=2): 全部完成, fallback_busy>0 | PASS |
+| §39 | Async Store + Async Load 并存: exact match, pending 全 0 | PASS |
+| §40 | 长时间压力: cap 64/128/256 × 500/1000/2000, invariant 持续, bit-exact | PASS |
+
+原有回归全部继续 PASS：
+
+| 套件 | 结果 |
+|---|---|
+| test_prefix_hash (§1–3) | 10 passed |
+| test_cpu_prefix_index | 27 passed |
+| test_prefix_cache_backend | 57 passed |
+| test_layout_v2 (Block-Major V2) | 190 passed |
+| test_cpu_prefix_scheduler (真实 CPU HIT 闭环) | 31 passed |
+| test_cpu_lru_admission (Admission+LRU) | 104 passed |
+| test_async_store (第七步) | 103 passed |
+
+§37 实测（2048 prefix）：Cold TTFT=214.26ms，CPU HIT async TTFT=12.14ms，speedup=**17.65x**，输出 exact match——async load 未破坏 CPU HIT 路径，且 L2 缓存收益（避免重算 prefix）完整保留。
+
+## 23. Benchmark 结果
+
+`benchmark_async_load.py`，真实 MLU KV + 真实 LLM（Qwen3-8B），median of 3–5。
+
+### §35 单请求 CPU HIT：sync vs async load
+
+| prefix | blocks | sync_load_ms | async_submit_us | async_wait_ms | correctness |
+|---|---|---|---|---|---|
+| 1024 | 64 | 6.454 | 275.79 | 6.235 | bit-exact |
+| 2048 | 128 | 12.766 | 362.63 | 12.525 | bit-exact |
+| 4096 | 256 | **25.392** | **537.7** | **25.111** | bit-exact |
+**单请求 async TTFT ≈ sync TTFT**（25.39ms vs 25.11ms）。这是**预期且正确**的：async 只把 submit（~550µs）移出关键路径，H2D+unpack（~25ms）仍须完成后 seq 才能 forward（num_cached_tokens 在 Event complete 前为 0，seq 在 LOAD_PENDING）。任务规格明确要求**不要把"单请求 TTFT 必须大幅下降"作为成功标准**——单请求的 load 延迟无法被消除，async 的收益在多请求调度（HoL 消除）与 compute/load 重叠，不在单请求延迟。
+
+### §36 Head-of-Line Blocking（Scheduler 级）
+
+A=4096 CPU HIT（load ~25ms）+ B=512 cold compute，同时提交：
+
+| 模式 | HoL total | B 首步 wall |
+|---|---|---|
+| sync | 352.86ms | 109.77ms |
+| async | 409.34ms | 89.53ms |
+
+**B 首步 HoL delay reduction = 20.24ms**（109.77 → 89.53ms）。sync 下 B 被堵在 A 的 ~25ms load 后（首步含 A load + A/B prefill）；async 下 A 进 LOAD_PENDING，B 立即 compute（首步只剩 B prefill + A 的 submit/poll 开销），B 不再被 A 的 load 阻塞。这是 async load 的**核心收益**。
+
+> HoL total async（409ms）略高于 sync（353ms）：async 下 A 的 load 移出首步但仍在后续 step 完成（poll + commit + suffix prefill），总墙钟含额外轮次；但 B 的关键首步延迟下降 20.24ms，这正是 HoL 消除的意义——优先级在于不阻塞就绪请求，而非总墙钟。
+
+### §37 Compute / Load Overlap（数据面）
+
+复用第七步方法论（backend-direct `submit_load` 在 transfer_stream + LLM compute 在默认流，compute 循环不 device-wide sync）：
+
+| 指标 | 值 |
+|---|---|
+| T_load_alone | 25.41 ms |
+| T_compute_alone | 81.86 ms |
+| T_overlap_wall | 87.53 ms |
+| overlap_efficiency | **0.777** |
+
+```
+overlap_efficiency = (T_load_alone + T_compute_alone - T_overlap_wall) / min(...)
+                  = (25.41 + 81.86 - 87.53) / 25.41
+                  = 0.777
+```
+
+overlap wall（87.5ms）≈ compute alone（81.9ms）+ 5.7ms 残留，**77.7% 的 load 被 compute 吸收**。H2D+unpack（transfer_stream）与 prefill compute（默认流）真实硬件重叠。残留 ~5.7ms 是 unpack 的 device scatter 尾部（与 compute 竞争 MLU 计算资源）+ poll 开销，无法完全重叠。
+
+> 对比第七步 Store overlap 0.845：Load 0.777 略低，因 H2D+unpack 的 unpack 段（device scatter 到 native layout）比 Store 的 pack 段更重，与 compute 资源竞争更多。但仍是强重叠。
+
+### §38 多请求并发（2/4/8，全 CPU HIT）
+| n | sync total / thr / ttft | async total / thr / ttft |
+|---|---|---|
+| 2 | 1380ms / 1.449 / 191.2ms | 1387ms / 1.442 / 266.8ms |
+| 4 | 1315ms / 3.041 / 193.8ms | 1444ms / 2.771 / 319.5ms |
+| 8 | 1327ms / 6.029 / 201.5ms | 1455ms / 5.50 / 327.2ms |
+
+**async 总墙钟略高于 sync（~8–10%），throughput 略低。** 这是该工作负载特性决定的，非缺陷：
+
+1. **同 prefix 同 batch + reset_l1_cache**：sync 下请求 1 同步 load 后**立即 commit 到 L1**，请求 2..N 变 L1 hit（免 CPU load），全程仅 1 次 CPU load。async 下请求 1/2 进 LOAD_PENDING（**延迟 commit**），L1 promotion 推迟，导致请求 3 需 sync fallback load、更多请求走 CPU load 路径——async 做了更多总 load 工作（2 pending + 1 fallback ≈ 3 次 vs sync 1 次）。
+2. **每 step poll 开销**：async 每个 step 调 `poll_load_completions`（event.query），N 个请求多轮 step 累积 poll 成本。
+3. **max_pending=2 限制重叠**：仅 2 个 load 可重叠，其余 fallback 串行。
+
+**结论**：对同 prefix 同 batch 的 load-bound 工作负载，立即 L1 promotion（sync）比延迟 promotion（async）更高效——sync 的"阻塞"反而因快速 promote 到 L1 而受益。async load 的价值**不在**这类负载的原始吞吐，而在 **HoL 消除**（§36，就绪请求不被 CPU-HIT 请求阻塞）与 **compute/load 重叠**（§37，有并发 compute 时 load 被吸收）。任务规格的 §38 要求测"多个同时 CPU HIT"，基准如实执行并如实报告该特性。
+
+### §41 长时间压力（Store+Load，纯数据面）
+
+| capacity | ops | submitted | completed | failed | fallback_busy | peak_ref | lru_protected_skips | inv_viol | final_load | correctness |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 64 | 500 | 49 | 49 | 0 | 185 | 2 | 0 | 0 | 0 | ok |
+| 128 | 1000 | 103 | 103 | 0 | 373 | 2 | 0 | 0 | 0 | ok |
+| 256 | 5000 | 491 | 491 | 0 | 1953 | 3 | 0 | 0 | 0 | ok |
+- 全程 `invariant_ok()` **0 违反**：ref_count>=0、free+ready+pending==capacity、ready/pending 不重叠。
+- `submitted == completed`，`failed=0`：无 load 失败、无丢失。
+- `fallback_busy` 大量出现：max_pending=2 下两 slot 占满的正常 sync fallback（§十二），不丢缓存（fallback 同步 Load 保证正确性）。
+- `lru_protected_skips=0`：ref>0 protected entry 从未被迫跳过淘汰（workload 下 evictable READY 充足）。
+- `peak_refcount` 达 2–3：concurrent shared load 真实发生，refcount 共享正确。
+- 最终 `flush_pending_loads` 后 `pending_load=0`、全部 slot FREE、`num_protected=0`：无 leak、无悬挂 ref。
+
+## 24. Metrics + 限制 + 结论
+
+### 新增 async load metrics（`CacheMetrics`）
+
+```
+cpu_async_load_submitted / completed / failed / cancelled
+cpu_async_load_pending_jobs / pending_blocks
+cpu_async_load_sync_fallback_busy / sync_fallback_too_large
+cpu_async_load_protected_blocks / peak_refcount
+cpu_async_load_submit_us_total / wait_ms_total / h2d_unpack_ms_total
+cpu_lru_protected_skips
+```
+
+`metrics_dict()` 暴露 `pending_load_jobs`、`ready_ref0`、`ready_ref_gt0`、`load_staging_*` 等诊断。
+
+### 当前限制
+
+1. **单请求 TTFT 不降**：async 只移出 submit（~550µs），H2D+unpack（~25ms）仍须完成才能 forward。这是设计本质，非缺陷（规格明确不以此为目标）。
+2. **max_pending=2**：两 slot 占满时新 load sync fallback（保证不丢缓存）。本阶段接受 fallback 代价。
+3. **单 slot 容量 320 blocks**：超过 → fallback 同步，未实现 chunked async load。
+4. **同 prefix 同 batch 吞吐不优**：延迟 L1 promotion 使 async 做更多 load 工作 + poll 开销，§38 async 总墙钟略高于 sync。async 价值在 HoL + overlap，不在 load-bound 同 prefix 吞吐。
+5. **Event 无法区分 copy 完成与 runtime failure**：query 异常按失败处理；Python/submit 侧异常 rollback 完整。
+6. **无 background thread**：poll 由 scheduler 每 step 驱动；无请求时 pending 收尾靠 `flush_pending_loads`。
+7. **Store 与 Load 共用 transfer_stream**：两者顺序执行不并行，但各自与默认流 compute 重叠。
+### 是否达成目标
+
+- ✅ Async Load 实现（AsyncLoadJob + StagingPool + submit_load + poll + flush + cancel）
+- ✅ LOAD_PENDING 状态机：seq 不 forward、Event complete 后 commit、回 waiting
+- ✅ CPU block refcount 保护：submit 前 acquire、Event complete 后 release、ref>0 不可淘汰
+- ✅ Scheduler 非阻塞：LOAD_PENDING seq 不阻塞其他 ready seq 调度
+- ✅ Event 记录在 unpack 之后
+- ✅ num_cached_tokens 只在 Event complete 后更新
+- ✅ Reserve/Commit 分离（allocate_prefix set_cached_tokens=False / complete_cpu_prefix_load）
+- ✅ Sync fallback（busy/too_large/io_fail）+ metric
+- ✅ Concurrent shared prefix load（ref 0→1→2→1→0）
+- ✅ Async Store + Async Load 共存
+- ✅ 102 测试全 PASS + 全部回归 PASS
+- ✅ 0 invariant 违反、bit-exact、无 leak/deadlock
+- ✅ HoL delay reduction 20.24ms（§36）
+- ✅ Compute/Load overlap efficiency 0.777（§37）
+
+---
+
+## 14 个问题回答
+
+1. **为什么只异步化 Load 的 H2D+unpack，而不把 lookup/commit 也异步？** lookup 是 CPU metadata 查询（µs 级，`match_prefix` 34µs/256 块），异步化无收益且增加复杂度；commit 必须在 Event complete 后由 Scheduler 操作 BlockManager/seq（backend 不持有），本就是 poll 回调里做。H2D+unpack（~25ms）才是阻塞大头，只异步化它即可把 Scheduler 解阻塞。
+
+2. **LOAD_PENDING Sequence 为什么不能 forward？** 三重保护：(1) seq 在 `pending_load_sequences`，不在 waiting/running，schedule 遍历不到；(2) `num_cached_tokens=0`（reserve 不设，commit 才设），即便误入 schedule 也是全量 prefill 而非部分；(3) Scheduler 持有引用，commit 后才移回 waiting。Event 未完成时 MLU native KV 尚未 scatter 就绪，forward 会读未初始化数据。
+
+3. **CPU block refcount 何时 acquire、何时 release？** submit **前** acquire（`_try_async_cpu_load` 里 `be.acquire_load_refs`，在 `submit_load` 之前，§十五），Event **complete/fail 后** release（`_complete_load_job`/`_fail_load_job` 里 `release_load_refs`）。refs 跨整个 H2D+unpack 在途期保持，防 LRU 淘汰源 CPU block。
+
+4. **ref>0 的 CPU block 为什么不能被 LRU 淘汰？** H2D 在 `transfer_stream` 异步读该 CPU block，若期间被 LRU 淘汰并复用/覆盖，H2D 会读到错误数据。`pop_lru_evictable` 跳过 ref>0，只淘汰 ref==0 的。
+
+5. **Event 为什么必须记录在 unpack 之后，而不是 H2D 之后？** H2D 只把数据搬到 staging（block-major），unpack 才 scatter 到 MLU native `(2,36,N,8,16,128)`。Event 在 unpack 之后记录，保证 commit 时 MLU native KV 已就绪；若仅 H2D 后记录，commit 时 native KV 未 scatter，forward 读未初始化数据。
+
+6. **num_cached_tokens 为什么只在 Event complete 后才更新？** num_cached_tokens 决定 seq 已 cached 多少 token（prefill 只算 suffix）。Event 未完成时 KV 未就绪，若提前设 num_cached_tokens，seq 会跳过 prefix 直接 prefill suffix，读到未初始化 KV。reserve 保持 0，commit（`complete_cpu_prefix_load`）才设，保证只有 KV 就绪后才生效（§三十二）。
+
+7. **Scheduler 如何在 load 在途时不阻塞其他 ready Sequence？** `schedule()` prefill 循环遇到 CPU HIT 且 async ok 时：`waiting.popleft()` + `pending_load_sequences.append(seq)` + `continue`——立即处理下一个 waiting seq，不等 Event。其他 ready seq（cold/L1-hit compute）在本 step 正常进 batch forward。load 在 transfer_stream 后台，与默认流 compute 重叠。
+
+8. **Event polling 放在哪？为什么在 schedule 之前？** `LLMEngine.step()` 在 `schedule()` **之前**调 `poll_load_completions()`（`llm_engine.py:116`）。完成的 load 在本 step 立即 commit + 回 waiting，**同一 step 即可被 schedule 调度**，减少额外一轮 latency。若放 schedule 之后，完成的 load 要等下一 step 才调度，多一轮延迟。
+9. **Load complete 后 cached state 何时 commit？谁负责？** Event complete 后由 **Scheduler** 的 `_complete_pending_load` 调 `BlockManager.complete_cpu_prefix_load`（commit_cpu_hit 注册 hash + 设 num_cached_tokens）。backend 的 `_complete_load_job` 只释放 staging/refs + 从 pending 删除，**不 commit**（backend 不持有 BlockManager/seq）。职责分离：backend 管 IO 资源，Scheduler 管 cached state。
+
+10. **Load fail 时如何释放 target MLU blocks / CPU refs / staging？** submit 侧 IO 异常：`submit_load` release staging + `failed+=1`，Scheduler release refs + `rollback_cpu_hit` 释放 target + 清 block_table + fallback 原路径。Event query 异常：`_fail_load_job` release staging+refs + `failed+=1`，Scheduler `_fail_pending_load` rollback target + seq 回 waiting 走原 prefill（不 commit）。
+
+11. **同一 CPU prefix 被多个 Request 同时命中时 refcount 如何变化？** `0→1`（A acquire）`→2`（B acquire，shared，peak_refcount=2）→ 两个 job 各自 submit（不同 target MLU blocks，各占一个 staging slot）→ poll: A complete `2→1`，B complete `1→0`。H2D 期间 ref>0 保护源 CPU blocks，两 load 完成后归 0 恢复可淘汰。A/B 各自 bit-exact，无 staging 互相覆盖。
+
+12. **max_pending=2 占满时新 load 怎么办？** `staging_busy` → Scheduler **sync fallback**：release CPU refs + 同步 `load_prefix`（复用已 reserve 的 target blocks）+ `complete_cpu_prefix_load` commit，seq 留 waiting 走正常 prefill。记 `sync_fallback_busy`。不丢缓存、不阻塞（fallback 是单次同步 load，不进 pending）。
+
+13. **单请求 async TTFT 为什么不比 sync 大幅下降？** async 只把 submit（~550µs）移出关键路径，H2D+unpack（~25ms）仍须完成 seq 才能 forward（num_cached_tokens 在 Event complete 前为 0，seq 在 LOAD_PENDING）。单请求的 load 延迟无法消除——async 收益在多请求 HoL 消除（B 首步 -20.24ms）与 compute/load 重叠（eff 0.777），不在单请求延迟。规格明确不以此为目标。
+
+14. **Async Load 是否达成目标？当前限制是什么？** 达成：非阻塞 Scheduler、HoL delay reduction 20.24ms、compute/load overlap 0.777、102 测试 + 全回归 PASS、0 invariant 违反、bit-exact、无 leak。限制：单请求 TTFT 不降（设计本质）、max_pending=2（超则 fallback）、单 slot 320 blocks（超则 fallback）、同 prefix 同 batch 吞吐不优（延迟 L1 promotion + poll 开销，§38 async 略慢于 sync）、Event 无法区分 copy 完成与 runtime failure。**async 价值在 HoL + overlap，不在 load-bound 同 prefix 吞吐。**
+## 最终裁决
+
+### **A. PASS**
+
+Async Load 正确运行；LOAD_PENDING 生命周期完整（seq 不 forward、Event complete 后 commit、回 waiting）；CPU block refcount 保护完整（submit 前 acquire、Event complete 后 release、ref>0 不可淘汰、double-release 防护）；Event 记录在 unpack 之后；num_cached_tokens 只在 Event complete 后更新；Reserve/Commit 分离正确；Scheduler 非阻塞（LOAD_PENDING seq 不阻塞其他 ready seq）；Sync fallback（busy/too_large/io_fail）完整；Concurrent shared prefix load refcount 0→1→2→1→0 正确；Async Store + Async Load 共存；102 测试 + 全部回归 PASS；长时间压力 0 invariant 违反、bit-exact、无 leak/deadlock。
+
+**核心收益达成**：HoL delay reduction **20.24ms**（§36，就绪请求不再被 CPU-HIT 请求的 ~25ms load 阻塞）；Compute/Load overlap efficiency **0.777**（§37，H2D+unpack 与 compute 真实硬件重叠，77.7% load 被 compute 吸收）。
+
+**如实记录的特性**：单请求 async TTFT ≈ sync（设计本质，规格不以此为目标）；同 prefix 同 batch load-bound 工作负载 async 总墙钟略高于 sync（延迟 L1 promotion + poll 开销，§38）——async load 的价值在 HoL 消除与 compute/load 重叠，不在 load-bound 同 prefix 吞吐。
+
+**Prefix KV Offload 第八步完成。**
+

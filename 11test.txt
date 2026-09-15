@@ -1,0 +1,396 @@
+# Prefix KV Offload —— 简历指标摘要
+
+> 仅含实测数据。N/A = 未运行或数据不足。
+
+## A. Concurrency Scaling — TTFT
+
+- conc=1: V5 TTFT p50=91.46ms vs V1 396.05ms (4.3x faster)
+- conc=16: V5 TTFT p50=122.48ms vs V1 1259.73ms (10.3x faster)
+- conc=64: V5 TTFT p50=350.14ms vs V1 1442.79ms (4.1x faster)
+
+## B. Throughput Peak
+
+- V5 peak: 2158.1tok/s at conc=64
+
+## C. Steady-state TPOT (Prefix HIT)
+
+- ctx=1024, conc=1: 10.30ms
+- ctx=1024, conc=8: 13.00ms
+- ctx=1024, conc=32: 16.24ms
+- ctx=4096, conc=1: 10.71ms
+- ctx=4096, conc=8: 14.14ms
+- ctx=4096, conc=32: 19.83ms
+- ctx=8192, conc=1: 11.27ms
+- ctx=8192, conc=8: 15.49ms
+- ctx=8192, conc=32: 25.80ms
+
+## D. Max Resident Concurrency (BF16 vs INT8)
+
+- ctx=4096: BF16=448 → INT8=512 (1.14x resident)
+  - KV block capacity: BF16=21432 → INT8=41565 (1.94x, 量化核心收益)
+- ctx=8192: BF16=288 → INT8=176 (0.61x resident)
+  - KV block capacity: BF16=21432 → INT8=41565 (1.94x, 量化核心收益)
+  - 注: INT8 ctx=8192 仅测到 176 (候选上限), 未充分扩展; 容量差异见 block 数
+
+## E. Reuse Ratio Break-even
+
+- V5 throughput 未超过 V1 (L1 直接命中 > L2 分层, 工作集适配 L1)
+- V5 P95 TTFT < V1 at reuse_ratio=100% (V5=1693.95ms vs V1=2418.53ms)
+- 洞察: L2 价值在 L1 容量不足 (工作集溢出) 时显现; 本实验 8 hot prefix 适配 L1
+
+## F. 8192 Prefix Config Boundary
+
+- max_blocks=512: skipped_too_large (8192+16suffix=513 blocks > 512)
+- max_blocks=513: success (精确边界), TTFT 134.32ms
+
+## G. Coalescing — H2D Reduction
+
+- conc=64: V5 load_jobs=8 vs V4 load_jobs=24
+- coalesced_requests: V5=504
+
+## H. Quantized L2 Traffic Saving
+
+- INT8 L2 vs BF16: -48% traffic, saved 615.5 GB total across runs
+
+## I. Hot-path Device Sync Discipline
+
+- max device_wide_sync_hotpath_count = 0 (§四 要求=0)
+
+
+# Prefix KV Offload 补充专项 Benchmark —— 完整报告
+
+生成时间: Tue Aug 25 18:41:43 CST 2026
+模型: Qwen3-8B | 硬件: MLU590-M9DG 80GB | TP=1
+
+---
+
+## 实验A: Concurrency Scaling
+
+| version | conc | TTFT p50 | TTFT p95 | TPOT p50 | tok/s | req/s | l2_hit | coalesced | peak_HBM |
+|---------|------|----------|----------|----------|-------|-------|--------|-----------|----------|
+| V1 | 1 | 396.05ms | 396.21ms | 10.88ms | 71.7 | 0.560 | 0.00% | 0 | 67.05GB |
+| V1 | 2 | 781.92ms | 785.54ms | 12.40ms | 108.6 | 0.848 | 0.00% | 0 | 67.65GB |
+| V1 | 4 | 1175.17ms | 1238.54ms | 13.49ms | 176.6 | 1.379 | 0.00% | 0 | 68.25GB |
+| V1 | 8 | 1243.51ms | 1245.88ms | 14.65ms | 330.0 | 2.578 | 0.00% | 0 | 70.06GB |
+| V1 | 16 | 1259.73ms | 1261.85ms | 17.85ms | 583.6 | 4.559 | 0.00% | 0 | 68.25GB |
+| V1 | 32 | 1310.51ms | 1311.53ms | 23.50ms | 953.5 | 7.449 | 0.00% | 0 | 70.06GB |
+| V1 | 64 | 1442.79ms | 1443.26ms | 35.26ms | 1383.2 | 10.806 | 0.00% | 0 | 68.25GB |
+| V3 | 1 | 86.83ms | 91.06ms | 10.87ms | 87.1 | 0.681 | 99.61% | 0 | 72.65GB |
+| V3 | 2 | 137.37ms | 139.53ms | 12.81ms | 149.6 | 1.169 | 99.61% | 0 | 72.65GB |
+| V3 | 4 | 196.61ms | 199.67ms | 13.48ms | 276.2 | 2.158 | 74.71% | 0 | 72.65GB |
+| V3 | 8 | 146.83ms | 209.02ms | 15.13ms | 494.7 | 3.865 | 37.35% | 0 | 72.84GB |
+| V3 | 16 | 160.65ms | 219.21ms | 18.09ms | 829.5 | 6.481 | 18.68% | 0 | 72.65GB |
+| V3 | 32 | 213.33ms | 271.51ms | 24.12ms | 1248.9 | 9.757 | 9.34% | 0 | 72.84GB |
+| V3 | 64 | 346.99ms | 347.98ms | 36.08ms | 1656.2 | 12.939 | 4.67% | 0 | 72.65GB |
+| V4 | 1 | 91.66ms | 92.07ms | 10.65ms | 88.6 | 0.692 | 99.61% | 0 | 69.67GB |
+| V4 | 2 | 176.16ms | 176.51ms | 12.97ms | 146.1 | 1.141 | 99.61% | 0 | 69.67GB |
+| V4 | 4 | 193.50ms | 195.88ms | 13.45ms | 279.9 | 2.187 | 74.71% | 0 | 71.48GB |
+| V4 | 8 | 126.87ms | 207.42ms | 14.61ms | 514.3 | 4.018 | 37.35% | 0 | 69.67GB |
+| V4 | 16 | 144.76ms | 221.32ms | 16.52ms | 907.0 | 7.086 | 18.68% | 0 | 69.67GB |
+| V4 | 32 | 198.50ms | 273.22ms | 20.33ms | 1472.4 | 11.503 | 9.34% | 0 | 69.67GB |
+| V4 | 64 | 327.58ms | 331.13ms | 27.81ms | 2103.9 | 16.437 | 4.67% | 0 | 69.67GB |
+| V5 | 1 | 91.46ms | 92.05ms | 10.68ms | 88.4 | 0.691 | 99.61% | 0 | 69.67GB |
+| V5 | 2 | 93.87ms | 94.55ms | 12.18ms | 155.9 | 1.218 | 49.81% | 8 | 68.90GB |
+| V5 | 4 | 96.68ms | 97.14ms | 12.66ms | 300.3 | 2.346 | 24.90% | 24 | 69.67GB |
+| V5 | 8 | 102.59ms | 106.34ms | 13.89ms | 548.4 | 4.284 | 12.45% | 56 | 69.67GB |
+| V5 | 16 | 122.48ms | 123.34ms | 15.81ms | 960.3 | 7.503 | 6.23% | 120 | 69.67GB |
+| V5 | 32 | 192.47ms | 195.96ms | 19.63ms | 1525.3 | 11.916 | 3.11% | 248 | 69.85GB |
+| V5 | 64 | 350.14ms | 354.89ms | 27.13ms | 2158.1 | 16.860 | 1.56% | 504 | 69.67GB |
+
+## 实验B: Long-output TPOT (steady vs churn)
+
+### Prefix-HIT steady-state TPOT (简历用)
+
+| version | ctx | conc | out | TPOT p50 | TPOT p95 |
+|---------|-----|------|-----|----------|----------|
+| V1 | 1024 | 1 | 128 | 10.09ms | 10.12ms |
+| V1 | 1024 | 1 | 256 | 10.11ms | 10.32ms |
+| V1 | 1024 | 8 | 128 | 13.01ms | 13.04ms |
+| V1 | 1024 | 8 | 256 | 13.14ms | 13.96ms |
+| V1 | 1024 | 32 | 128 | 16.91ms | 17.47ms |
+| V1 | 1024 | 32 | 256 | 16.55ms | 16.81ms |
+| V1 | 4096 | 1 | 128 | 10.88ms | 10.92ms |
+| V1 | 4096 | 1 | 256 | 10.87ms | 10.88ms |
+| V1 | 4096 | 8 | 128 | 14.63ms | 15.18ms |
+| V1 | 4096 | 8 | 256 | 14.64ms | 14.91ms |
+| V1 | 4096 | 32 | 128 | 23.54ms | 24.61ms |
+| V1 | 4096 | 32 | 256 | 23.98ms | 24.50ms |
+| V1 | 8192 | 1 | 128 | 11.27ms | 11.34ms |
+| V1 | 8192 | 1 | 256 | 11.28ms | 11.37ms |
+| V1 | 8192 | 8 | 128 | 16.99ms | 17.65ms |
+| V1 | 8192 | 8 | 256 | 17.05ms | 17.38ms |
+| V1 | 8192 | 32 | 128 | 32.95ms | 32.99ms |
+| V1 | 8192 | 32 | 256 | 33.30ms | 33.32ms |
+| V3 | 1024 | 1 | 128 | 10.08ms | 10.68ms |
+| V3 | 1024 | 1 | 256 | 10.09ms | 10.10ms |
+| V3 | 1024 | 8 | 128 | 13.07ms | 13.21ms |
+| V3 | 1024 | 8 | 256 | 13.06ms | 13.09ms |
+| V3 | 1024 | 32 | 128 | 16.89ms | 17.44ms |
+| V3 | 1024 | 32 | 256 | 16.64ms | 16.91ms |
+| V3 | 4096 | 1 | 128 | 10.89ms | 11.05ms |
+| V3 | 4096 | 1 | 256 | 10.88ms | 10.90ms |
+| V3 | 4096 | 8 | 128 | 15.37ms | 15.92ms |
+| V3 | 4096 | 8 | 256 | 14.79ms | 15.06ms |
+| V3 | 4096 | 32 | 128 | 23.83ms | 24.89ms |
+| V3 | 4096 | 32 | 256 | 23.76ms | 24.29ms |
+| V3 | 8192 | 1 | 128 | 11.27ms | 11.29ms |
+| V3 | 8192 | 1 | 256 | 11.28ms | 11.40ms |
+| V3 | 8192 | 8 | 128 | 17.01ms | 17.70ms |
+| V3 | 8192 | 8 | 256 | 17.06ms | 17.39ms |
+| V3 | 8192 | 32 | 128 | 33.83ms | 34.18ms |
+| V3 | 8192 | 32 | 256 | 33.31ms | 33.38ms |
+| V5 | 1024 | 1 | 128 | 10.30ms | 10.30ms |
+| V5 | 1024 | 1 | 256 | 10.32ms | 10.33ms |
+| V5 | 1024 | 8 | 128 | 13.00ms | 13.61ms |
+| V5 | 1024 | 8 | 256 | 13.01ms | 13.43ms |
+| V5 | 1024 | 32 | 128 | 16.24ms | 16.93ms |
+| V5 | 1024 | 32 | 256 | 15.75ms | 16.10ms |
+| V5 | 4096 | 1 | 128 | 10.71ms | 10.72ms |
+| V5 | 4096 | 1 | 256 | 10.71ms | 11.03ms |
+| V5 | 4096 | 8 | 128 | 14.14ms | 14.84ms |
+| V5 | 4096 | 8 | 256 | 14.06ms | 14.40ms |
+| V5 | 4096 | 32 | 128 | 19.83ms | 21.04ms |
+| V5 | 4096 | 32 | 256 | 19.62ms | 20.22ms |
+| V5 | 8192 | 1 | 128 | 11.27ms | 11.28ms |
+| V5 | 8192 | 1 | 256 | 11.26ms | 11.27ms |
+| V5 | 8192 | 8 | 128 | 15.49ms | 16.30ms |
+| V5 | 8192 | 8 | 256 | 15.48ms | 15.96ms |
+| V5 | 8192 | 32 | 128 | 25.80ms | 26.81ms |
+| V5 | 8192 | 32 | 256 | 25.81ms | 26.24ms |
+### High Store-Churn TPOT (系统代价)
+
+| version | ctx | conc | out | TPOT p50 | TPOT p95 | store_delta | skipped |
+|---------|-----|------|-----|----------|----------|-------------|---------|
+| V1 | 1024 | 1 | 128 | 10.10ms | 10.28ms | 0 | 0 |
+| V1 | 1024 | 1 | 256 | 10.11ms | 10.15ms | 0 | 0 |
+| V1 | 1024 | 8 | 128 | 13.00ms | 13.01ms | 0 | 0 |
+| V1 | 1024 | 8 | 256 | 13.04ms | 13.21ms | 0 | 0 |
+| V1 | 1024 | 32 | 128 | 18.09ms | 29.06ms | 0 | 0 |
+| V1 | 1024 | 32 | 256 | 17.48ms | 22.94ms | 0 | 0 |
+| V1 | 4096 | 1 | 128 | 10.86ms | 10.87ms | 0 | 0 |
+| V1 | 4096 | 1 | 256 | 10.87ms | 11.11ms | 0 | 0 |
+| V1 | 4096 | 8 | 128 | 21.21ms | 30.64ms | 0 | 0 |
+| V1 | 4096 | 8 | 256 | 18.06ms | 22.73ms | 0 | 0 |
+| V1 | 4096 | 32 | 128 | 68.03ms | 114.89ms | 0 | 0 |
+| V1 | 4096 | 32 | 256 | 46.09ms | 69.37ms | 0 | 0 |
+| V1 | 8192 | 1 | 128 | 11.27ms | 11.27ms | 0 | 0 |
+| V1 | 8192 | 1 | 256 | 11.28ms | 11.29ms | 0 | 0 |
+| V1 | 8192 | 8 | 128 | 44.88ms | 65.57ms | 0 | 0 |
+| V1 | 8192 | 8 | 256 | 31.11ms | 41.46ms | 0 | 0 |
+| V1 | 8192 | 32 | 128 | 143.35ms | 239.57ms | 0 | 0 |
+| V1 | 8192 | 32 | 256 | 88.79ms | 136.62ms | 0 | 0 |
+| V3 | 1024 | 1 | 128 | 10.08ms | 10.12ms | 330.0 | 0 |
+| V3 | 1024 | 1 | 256 | 10.11ms | 10.12ms | 330.0 | 0 |
+| V3 | 1024 | 8 | 128 | 13.33ms | 13.36ms | 20880.0 | 0 |
+| V3 | 1024 | 8 | 256 | 13.21ms | 13.52ms | 20880.0 | 0 |
+| V3 | 1024 | 32 | 128 | 19.70ms | 30.66ms | 333120.0 | 0 |
+| V3 | 1024 | 32 | 256 | 18.36ms | 23.81ms | 333120.0 | 0 |
+| V3 | 4096 | 1 | 128 | 10.89ms | 10.90ms | 1290.0 | 0 |
+| V3 | 4096 | 1 | 256 | 10.89ms | 11.10ms | 1290.0 | 0 |
+| V3 | 4096 | 8 | 128 | 22.68ms | 32.12ms | 82320.0 | 0 |
+| V3 | 4096 | 8 | 256 | 18.80ms | 23.48ms | 82320.0 | 0 |
+| V3 | 4096 | 32 | 128 | 74.11ms | 120.85ms | 1316160.0 | 0 |
+| V3 | 4096 | 32 | 256 | 49.17ms | 72.35ms | 1316160.0 | 0 |
+| V3 | 8192 | 1 | 128 | 11.27ms | 11.28ms | 0 | 5.0 |
+| V3 | 8192 | 1 | 256 | 11.55ms | 11.64ms | 0 | 5.0 |
+| V3 | 8192 | 8 | 128 | 44.95ms | 65.66ms | 0 | 320.0 |
+| V3 | 8192 | 8 | 256 | 31.19ms | 41.48ms | 0 | 320.0 |
+| V3 | 8192 | 32 | 128 | 143.76ms | 240.04ms | 0 | 5120.0 |
+| V3 | 8192 | 32 | 256 | 89.02ms | 137.02ms | 0 | 5120.0 |
+| V5 | 1024 | 1 | 128 | 10.28ms | 10.29ms | 330.0 | 0 |
+| V5 | 1024 | 1 | 256 | 10.29ms | 10.49ms | 330.0 | 0 |
+| V5 | 1024 | 8 | 128 | 13.13ms | 13.24ms | 20880.0 | 0 |
+| V5 | 1024 | 8 | 256 | 13.09ms | 13.16ms | 20880.0 | 0 |
+| V5 | 1024 | 32 | 128 | 18.34ms | 29.67ms | 333120.0 | 0 |
+| V5 | 1024 | 32 | 256 | 17.21ms | 22.85ms | 333120.0 | 0 |
+| V5 | 4096 | 1 | 128 | 10.73ms | 10.74ms | 1290.0 | 0 |
+| V5 | 4096 | 1 | 256 | 10.73ms | 10.81ms | 1290.0 | 0 |
+| V5 | 4096 | 8 | 128 | 21.56ms | 31.63ms | 82320.0 | 0 |
+| V5 | 4096 | 8 | 256 | 17.89ms | 22.92ms | 82320.0 | 0 |
+| V5 | 4096 | 32 | 128 | 69.38ms | 118.19ms | 1316160.0 | 0 |
+| V5 | 4096 | 32 | 256 | 44.68ms | 68.95ms | 1316160.0 | 0 |
+| V5 | 8192 | 1 | 128 | 11.26ms | 11.29ms | 0 | 5.0 |
+| V5 | 8192 | 1 | 256 | 11.28ms | 11.53ms | 0 | 5.0 |
+| V5 | 8192 | 8 | 128 | 44.58ms | 66.34ms | 0 | 320.0 |
+| V5 | 8192 | 8 | 256 | 30.10ms | 40.91ms | 0 | 320.0 |
+| V5 | 8192 | 32 | 128 | 141.78ms | 243.10ms | 0 | 5120.0 |
+| V5 | 8192 | 32 | 256 | 83.79ms | 134.26ms | 0 | 5120.0 |
+
+## 实验C: Maximum Resident Concurrency (BF16 vs INT8 KV)
+
+| kv_dtype | ctx | num_blocks | capacity_tok | per_seq_blk | theoretical | successful | peak_HBM | reason |
+|----------|-----|------------|--------------|-------------|-------------|------------|----------|--------|
+| bf16 | 4096 | 21432 | 342912 | 259 | 82 | 448 | 70.40GB |  |
+| bf16 | 8192 | 21432 | 342912 | 515 | 41 | 288 | 69.65GB |  |
+| int8 | 4096 | 41565 | 665040 | 259 | 160 | 512 | 70.57GB |  |
+| int8 | 8192 | 41565 | 665040 | 515 | 80 | 176 | 70.00GB |  |
+
+## 实验D: Prefix Reuse Ratio Sweep
+
+
+| version | reuse | n_req | TTFT p50 | TTFT p95 | TPOT | tok/s | req/s | l1_hit | l2_hit | miss | coalesced |
+|---------|-------|-------|----------|----------|------|-------|-------|--------|--------|------|-----------|
+| V1 | 0% | 300 | 3546.63ms | 6295.27ms | 39.68ms | 233.6 | 1.825 | 0.00% | 0.00% | 100.00% | 0 |
+| V1 | 25% | 300 | 3553.15ms | 5946.06ms | 33.81ms | 252.6 | 1.973 | 11.95% | 0.00% | 88.05% | 0 |
+| V1 | 50% | 300 | 2571.14ms | 4906.88ms | 27.42ms | 303.5 | 2.371 | 34.86% | 0.00% | 65.14% | 0 |
+| V1 | 75% | 300 | 1495.54ms | 3604.31ms | 20.95ms | 422.0 | 3.297 | 66.41% | 0.00% | 33.59% | 0 |
+| V1 | 90% | 300 | 1402.05ms | 2811.44ms | 17.82ms | 487.0 | 3.805 | 76.70% | 0.00% | 23.30% | 0 |
+| V1 | 100% | 300 | 274.63ms | 2418.53ms | 17.49ms | 669.1 | 5.227 | 93.63% | 0.00% | 6.37% | 0 |
+| V3 | 0% | 300 | 3565.17ms | 6331.14ms | 42.91ms | 221.5 | 1.731 | 0.00% | 0.00% | 100.00% | 0 |
+| V3 | 25% | 300 | 3562.41ms | 6107.03ms | 40.68ms | 222.8 | 1.740 | 1.33% | 1.33% | 97.34% | 2 |
+| V3 | 50% | 300 | 3574.14ms | 5965.89ms | 34.33ms | 244.3 | 1.909 | 11.29% | 4.65% | 84.06% | 5 |
+| V3 | 75% | 300 | 2482.79ms | 4790.19ms | 27.38ms | 299.5 | 2.340 | 28.22% | 11.08% | 60.70% | 13 |
+| V3 | 90% | 300 | 2445.45ms | 3949.99ms | 22.16ms | 335.0 | 2.617 | 32.98% | 17.23% | 49.79% | 12 |
+| V3 | 100% | 300 | 1359.92ms | 1662.74ms | 18.27ms | 514.9 | 4.023 | 51.20% | 29.85% | 18.95% | 13 |
+| V5 | 0% | 300 | 3725.02ms | 6629.28ms | 40.93ms | 223.7 | 1.747 | 0.00% | 0.00% | 100.00% | 0 |
+| V5 | 25% | 300 | 3724.80ms | 6266.63ms | 38.78ms | 222.5 | 1.738 | 1.33% | 1.33% | 97.34% | 2 |
+| V5 | 50% | 300 | 3772.82ms | 6207.24ms | 32.25ms | 244.0 | 1.907 | 11.29% | 4.65% | 84.06% | 5 |
+| V5 | 75% | 300 | 2626.91ms | 5054.97ms | 25.52ms | 300.9 | 2.351 | 30.22% | 9.71% | 60.08% | 12 |
+| V5 | 90% | 300 | 2575.47ms | 4005.87ms | 18.44ms | 338.7 | 2.646 | 36.81% | 13.66% | 49.53% | 11 |
+| V5 | 100% | 300 | 1338.67ms | 1693.95ms | 16.26ms | 542.4 | 4.238 | 62.18% | 20.36% | 17.46% | 13 |
+
+## 实验E: 8192 Prefix Config Validation
+
+| version | max_blocks | nreq | store_result | l2_hit_blocks | load_jobs | TTFT p50 |
+|---------|-------------|------|--------------|---------------|-----------|----------|
+| V3 | 320 | 8 | skipped_too_large | 0 | 0 | 954.51ms |
+| V3 | 320 | 16 | skipped_too_large | 0 | 0 | 986.08ms |
+| V5 | 320 | 8 | skipped_too_large | 0 | 0 | 1019.60ms |
+| V5 | 320 | 16 | skipped_too_large | 0 | 0 | 1057.10ms |
+| V5 | 512 | 8 | skipped_too_large | 0 | 0 | 1019.79ms |
+| V5 | 512 | 16 | skipped_too_large | 0 | 0 | 1054.75ms |
+| V5 | 513 | 8 | success | 98304 | 1 | 134.32ms |
+| V5 | 513 | 16 | success | 393216 | 1 | 168.73ms |
+| V5 | 640 | 8 | success | 98304 | 1 | 134.64ms |
+| V5 | 640 | 16 | success | 393216 | 1 | 170.94ms |
+
+---
+## 18 问答案 (§二十三)
+
+### Concurrency Scaling (Q1-Q7)
+
+**Q1: V5 各 concurrency 的 TTFT p50/p95**
+- conc=1: TTFT p50=91.46ms, p95=92.05ms
+- conc=2: TTFT p50=93.87ms, p95=94.55ms
+- conc=4: TTFT p50=96.68ms, p95=97.14ms
+- conc=8: TTFT p50=102.59ms, p95=106.34ms
+- conc=16: TTFT p50=122.48ms, p95=123.34ms
+- conc=32: TTFT p50=192.47ms, p95=195.96ms
+- conc=64: TTFT p50=350.14ms, p95=354.89ms
+
+**Q2: V5 TPOT 是否随 concurrency 退化**
+- conc 1→64: TPOT 10.68ms→27.13ms (2.54x)
+- 退化
+
+**Q3: V5 token throughput scaling 倍数**
+- conc 1→64: 88.4tok/s→2158.1tok/s (24.41x)
+
+**Q4: V5 throughput peak 出现在多少并发**
+- peak at conc=64: 2158.1tok/s
+
+**Q5: V5 vs V1 在 conc=16/32/64 的 throughput 提升**
+- conc=16: V5 960.3tok/s vs V1 583.6tok/s = 1.65x
+- conc=32: V5 1525.3tok/s vs V1 953.5tok/s = 1.60x
+- conc=64: V5 2158.1tok/s vs V1 1383.2tok/s = 1.56x
+**Q6: V5 vs V3: Quantized+Coalescing 后 throughput 升/降**
+- conc=16: V5 960.3tok/s vs V3 829.5tok/s = 1.16x (升)
+- conc=32: V5 1525.3tok/s vs V3 1248.9tok/s = 1.22x (升)
+- conc=64: V5 2158.1tok/s vs V3 1656.2tok/s = 1.30x (升)
+
+**Q7: Coalescing 在高并发是否继续减少 H2D**
+- conc=32: load_jobs=8, coalesced_requests=248
+- conc=64: load_jobs=8, coalesced_requests=504
+- V5 vs V4 (coalesce ON vs OFF):
+  - conc=32: V5 load_jobs=8 vs V4 load_jobs=24
+  - conc=64: V5 load_jobs=8 vs V4 load_jobs=24
+
+### Long-output TPOT (Q8-Q10)
+
+**Q8: V5 steady-state TPOT (output=128) 各 context/conc**
+- ctx=1024, conc=1: TPOT p50=10.30ms, p95=10.30ms
+- ctx=1024, conc=8: TPOT p50=13.00ms, p95=13.61ms
+- ctx=1024, conc=32: TPOT p50=16.24ms, p95=16.93ms
+- ctx=4096, conc=1: TPOT p50=10.71ms, p95=10.72ms
+- ctx=4096, conc=8: TPOT p50=14.14ms, p95=14.84ms
+- ctx=4096, conc=32: TPOT p50=19.83ms, p95=21.04ms
+- ctx=8192, conc=1: TPOT p50=11.27ms, p95=11.28ms
+- ctx=8192, conc=8: TPOT p50=15.49ms, p95=16.30ms
+- ctx=8192, conc=32: TPOT p50=25.80ms, p95=26.81ms
+**Q9: steady vs churn TPOT 差距 (V5, ctx=4096, conc=8, out=128)**
+- steady=14.14ms vs churn=21.56ms (churn 1.52x, store 代价 7.42ms)
+
+**Q10: 8192 context 是否触发 skipped_too_large (churn, 默认 max_blocks=320)**
+- V3 ctx=8192 conc=1: skipped_too_large=5.0
+- V3 ctx=8192 conc=1: skipped_too_large=5.0
+- V3 ctx=8192 conc=8: skipped_too_large=320.0
+- V3 ctx=8192 conc=8: skipped_too_large=320.0
+- V3 ctx=8192 conc=32: skipped_too_large=5120.0
+- V3 ctx=8192 conc=32: skipped_too_large=5120.0
+- V5 ctx=8192 conc=1: skipped_too_large=5.0
+- V5 ctx=8192 conc=1: skipped_too_large=5.0
+- V5 ctx=8192 conc=8: skipped_too_large=320.0
+- V5 ctx=8192 conc=8: skipped_too_large=320.0
+- V5 ctx=8192 conc=32: skipped_too_large=5120.0
+- V5 ctx=8192 conc=32: skipped_too_large=5120.0
+
+### Max Resident Concurrency (Q11-Q12)
+
+**Q11: BF16 vs INT8 最大 resident concurrency**
+- ctx=4096: BF16=448 vs INT8=512 (1.14x resident)
+  - KV block capacity: BF16=21432 vs INT8=41565 (1.94x, 量化容量提升)
+- ctx=8192: BF16=288 vs INT8=176 (0.61x resident)
+  - KV block capacity: BF16=21432 vs INT8=41565 (1.94x, 量化容量提升)
+
+**Q12: 实际 vs 理论 resident concurrency**
+- bf16 ctx=4096: actual=448 theoretical=82 (actual/theoretical=5.46x)
+- bf16 ctx=8192: actual=288 theoretical=41 (actual/theoretical=7.02x)
+- int8 ctx=4096: actual=512 theoretical=160 (actual/theoretical=3.20x)
+- int8 ctx=8192: actual=176 theoretical=80 (actual/theoretical=2.20x)
+
+### Reuse Ratio Sweep (Q13-Q14)
+
+**Q13: break-even reuse_ratio (V5 throughput >= V1)**
+- 未找到 break-even (V5 始终低于 V1, 或数据不全)
+
+**Q14: break-even reuse_ratio (V5 P95 TTFT < V1)**
+- V5 P95 TTFT < V1 首次出现在 reuse_ratio=100%
+  - V5=1693.95ms vs V1=2418.53ms
+
+### 8192 Config Validation (Q15-Q16)
+
+**Q15: max_blocks=320 时 8192 prefix 是否 skipped_too_large**
+- V3: store_result=skipped_too_large, skipped=1
+- V3: store_result=skipped_too_large, skipped=1
+- V5: store_result=skipped_too_large, skipped=1
+- V5: store_result=skipped_too_large, skipped=1
+
+**Q16: max_blocks>=512 时 8192 prefix 是否成功 store + L2 命中**
+- V5 max_blocks=512: store=skipped_too_large, l2_hit_blocks=0, TTFT p50=1019.79ms
+- V5 max_blocks=512: store=skipped_too_large, l2_hit_blocks=0, TTFT p50=1054.75ms
+- V5 max_blocks=513: store=success, l2_hit_blocks=98304, TTFT p50=134.32ms
+- V5 max_blocks=513: store=success, l2_hit_blocks=393216, TTFT p50=168.73ms
+- V5 max_blocks=640: store=success, l2_hit_blocks=98304, TTFT p50=134.64ms
+- V5 max_blocks=640: store=success, l2_hit_blocks=393216, TTFT p50=170.94ms
+
+### System-level (Q17-Q18)
+
+**Q17: 热路径 device-wide sync 次数 (应为 0)**
+- 所有实验 max device_wide_sync_hotpath_count = 0 (✓ 符合 §四)
+
+**Q18: 量化 L2 流量节省 (V5 vs V3)**
+- V5 量化流量节省总量: 615.48 GB (INT8 vs BF16, -48% 流量)
+
+
+---
+## 裁决 (§二十四)
+
+### 完成度检查 (§二十五 停止条件)
+- Exp A (conc 1-64, output=128): ✓ (28 rows)
+- Exp B (steady+churn TPOT): ✓ (108 rows)
+- Exp C (BF16 vs INT8 max resident): ✓ (4 rows)
+- Exp D (reuse 0-100%): ✓ (18 rows)
+- Exp E (8192 max_blocks 320/512/640): ✓ (10 rows)
+- CSV 文件: 9
+- 图表数据: 7/7
+
+**裁决: A.PASS** — 全部实验完成, 数据完整, 7 图表数据齐全

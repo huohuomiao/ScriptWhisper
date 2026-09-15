@@ -1,0 +1,280 @@
+# Prefix KV Offload 第六步 —— CPU Prefix Cache Admission + LRU Eviction + 长时间稳定性验证
+
+> 报告: `cpu_lru_admission_report.md`
+> 数据: `cpu_lru_admission_benchmark.csv`
+> 测试: `test_cpu_lru_admission.py` (104 passed / 0 failed)
+> 回归: index 27/0, backend 57/0, layout_v2 190/0, scheduler 31/0
+
+---
+
+## 1. 当前 CPU L2 Cache 生命周期问题
+
+第五步交付的 CPU Prefix Cache 是"能正确命中但无界"的缓存：
+
+- **容量无界**：CPU pool 满后只能 `skip store`（`store_blocks` 返回 `insufficient_cpu_blocks`），新 prefix 永远进不来 —— **池满即永久停止学习新数据**。
+- **无准入**：任何完整 block 都会被 Store，短 prefix（如 64 token）也占 CPU block，浪费容量。
+- **无淘汰**：无 LRU/ARC，冷数据常驻，热数据被挤不进来。
+- **缓存 decode KV**：第五步 Store 了 prompt + decode 的全部完整块，decode KV 是 request-specific、不可复用的，占容量无收益。
+- **无 metrics**：无法观测命中率/淘汰/占用，调参无依据。
+
+第六步目标：把"能正确命中"升级为 **容量有界 + 有准入 + 有 LRU 淘汰 + 可回收 + 长期不泄漏 + 有 metrics**，仍保持同步 Store/Load。
+
+## 2. Admission Policy
+
+新增 `cpu_prefix_min_tokens`（默认 1024）。Store 前：
+
+1. 收集完整可缓存 blocks（不含 partial 末块）
+2. `prompt_only=True` 时截断到 prompt full blocks
+3. `cacheable_tokens = num_cacheable_blocks * block_size`
+4. `cacheable_tokens < min_tokens` → skip，`reason="below_min_tokens"`，`cpu_store_skipped_short += 1`
+5. 否则继续 dedup → eviction → store
+
+第一版固定阈值，不做动态阈值。
+
+## 3. min_prefix_tokens 选择依据
+
+设为 **1024 tokens**（= 64 blocks × 16）：
+
+- **break-even 依据**：第五步基准显示 CPU HIT speedup 在 512-token 时为 0.97x（噪声级，Load 开销 ~3.5ms 与省下的 prefill ~30ms 相当），1024-token 时为 1.29x（净收益转正）。min_tokens=1024 正好在 break-even 点之上，保证被准入的 prefix 都有正收益。
+- **容量效益**：短 prefix（如 system prompt 片段、单轮对话）复用价值低却占 CPU block，设阈值避免低价值缓存挤占高价值长 prefix 的容量。
+- **block 对齐**：1024 = 64×16，整数倍 block，cacheable_tokens 计算无 partial 残留。
+
+## 4. Prompt-only Store
+
+**成功实现**。`cpu_prefix_prompt_only=True`（默认）时只 Store prompt 对应完整 prefix blocks，不缓存 decode KV。
+
+**prompt/decode 边界识别**：`Sequence.__init__` 记录 `num_prompt_tokens = len(token_ids)`（prompt token 数），decode 阶段 `append_token` 只增 `num_tokens` 不增 `num_prompt_tokens`。故 prompt full block 数 = `seq.num_prompt_tokens // block_size`，可靠区分。
+
+Scheduler `_store_to_cpu` 把 `prompt_block_limit = seq.num_prompt_tokens // block_size` 传给 `backend.store_blocks`，backend 截断 `block_hashes[:limit]`。测试 §23 验证：prompt 2048 + decode 256 → 只存 128 prompt full blocks，decode 的第 129 块不入 index。
+
+## 5. LRU 数据结构
+
+`CPUPrefixIndex` 内部用 `collections.OrderedDict[block_hash, cpu_block_id]`（不手写双向链表）：
+
+- **key** = xxh64 chained block hash
+- **value** = cpu_block_id
+- **LRU 端 = first（iter 头）**：最久未被 CPU Prefix Lookup HIT 使用的 block
+- **MRU 端 = last（iter 尾）**：最近真正被 CPU Prefix Lookup HIT 使用的 block
+- 新 insert 追加到 MRU 端（last）
+- victim 选择 = `pop_lru()` 删 first
+
+复杂度（OrderedDict 保证）：lookup O(1)、touch O(1)、victim 选择 O(1)、remove O(1)。
+
+## 6. HIT Touch 语义
+
+**只有 CPU Prefix Lookup HIT 才 touch**（`match_prefix` 内 `move_to_end` → MRU）。
+
+- Duplicate Store **不 touch**（§九）：`insert` 遇已存在 hash 时不 `move_to_end`，保持原 LRU 位置。理由：cache 热度由真实读取/复用决定，而非重复写入。
+- MISS 及其后的 block 不 touch（即使后续 hash 存在，因中间 MISS 已 break）。
+- 测试 §21 验证：Store [A,B,C] 再 Store [A,B,C,D]，A/B/C 的 LRU 顺序不变，D 追加 MRU。
+
+## 7. Eviction 流程
+
+Pool 不够时（`free < num_new`）：
+
+```
+need_evict = num_new - free
+for _ in range(need_evict):
+    victim_hash, victim_cpu = index.pop_lru()   # 删 first (LRU)
+    cpu_pool.free([victim_cpu])                 # 归还 block
+    evicted += 1
+```
+
+严格顺序（§十二）：**先删 index metadata，再 free cpu block**，再允许该 block 被 allocator 复用，最后 Store 新 KV + commit 新 hash。禁止先 free block 而旧 hash mapping 仍存在。
+
+## 8. Duplicate Store
+
+`store_blocks` 先 `new_idx = [i for h not in index]` 去重：
+
+- 已索引的 hash 跳过（不重复占 CPU block，§八）
+- 新增 0 block → skip data copy，`reason="all_cached"`，`cpu_store_duplicate_blocks += len`
+- 新增 > 0 → 只对 new_idx 对应的 mlu/cpu block 做 D2H
+- Duplicate **不 touch** LRU（§九），不改变已缓存块的顺序
+
+测试 §21：Store [A,B,C]（used=3）再 Store [A,B,C,D] 只新增 D（used=4），eviction=0，A/B/C 顺序不变。
+
+## 9. Eviction + Store Failure Rollback
+
+场景：先淘汰 victim → allocate 新 CPU blocks → `mover.store()` 失败。
+
+回滚（§十三）：
+- 新 hash **不得 commit**（store 失败时未到 commit 步）
+- 已 allocate 的新 cpu blocks `cpu_pool.free(new_cpu)` 归还
+- index 无半成品（commit 在 store 成功后）
+- 无 double free（新块只 free 一次）
+- 无多 hash 指向同一 cpu block（commit 未执行）
+- **已淘汰的旧 victim 不回滚恢复**（本阶段接受）
+测试 §13：注入 `mover.store` 异常 → `success=False, reason=store_io_failure, evicted=1`，C 未入 index，index len=1（只 B，A 已淘汰），used=1/free=1，invariant ok。
+
+**实现细节**：eviction 后 free list 出现空洞，`cpu_pool.allocate` 返回的 new_cpu 可能非连续。原 `mover.store` 要求 CPU ids 连续（一次 D2H 直达），会抛 `主性能路径要求 CPU ids 连续`。**已修复**：store 改为按 `split_contiguous_runs(new_cpu)` 分段 D2H，每段连续直达，host 端零 reformat。此修复同时让压力测试 5000 ops 的 bit-exact 抽样通过。
+
+## 10. Prefix Chain + Eviction
+
+`match_prefix` 顺序扫描，遇第一个 MISS 立即 break，不 sparse hit。中间 block 被淘汰后，Longest Prefix 正确在该处截断。
+
+测试 §25：缓存 A B C D，remove B（中间块），query A B C D → matched=1（只 A 命中，B MISS 即停，不跳到 C/D）。验证 Longest Prefix 与 LRU 结合正确。
+
+## 11. Cache Metrics
+
+`CacheMetrics`（§十六）：
+
+| 指标 | 语义 |
+|---|---|
+| `cpu_cache_lookups` | lookup 调用次数 |
+| `cpu_cache_lookup_blocks` | lookup 查询的 block 数（denominator） |
+| `cpu_cache_hit_blocks` | 命中 block 数（numerator） |
+| `cpu_cache_misses` | lookup 完全未命中（n=0）次数 |
+| `cpu_store_requests` | store 调用次数 |
+| `cpu_store_blocks` | 实际新存 block 数 |
+| `cpu_store_duplicate_blocks` | 去重跳过的 block 数 |
+| `cpu_store_skipped_short` | 因 below_min_tokens 跳过次数 |
+| `cpu_store_skipped_empty` | 空 store 跳过次数 |
+| `cpu_evictions` | LRU 淘汰 block 数 |
+| `cpu_hit_tokens` | 命中 token 数 |
+| `block_hit_rate` | `hit_blocks / lookup_blocks` |
+
+`block_hit_rate` denominator = `cpu_cache_lookup_blocks`（每次 lookup 查询的全部 block 数，含未命中的尾部）。明确：这是 block 级命中率，不是 request 级。
+
+## 12. Scheduler 集成回归
+
+`test_cpu_prefix_scheduler.py` 31/0 PASS（关闭 admission/prompt-only 保持第五步用例行为；admission/LRU 验证在 `test_cpu_lru_admission.py`）。
+
+四个核心场景（§二十六）均通过：
+- **Case 1**：长 prefix 被 admission 接受 → CPU Store → L1 reset → CPU HIT → 输出 exact match（Case C）
+- **Case 2**：短 prefix 被 admission 拒绝 → L1 reset → CPU MISS → Cold Prefill → 输出正确（§22 admission 测试）
+- **Case 3**：某 prefix 被 LRU 淘汰 → L1 reset → CPU MISS → fallback Cold Prefill → 输出正确（§25 + Rollback）
+- **Case 4**：热 prefix 经 CPU lookup touch → 不被下一轮 eviction → L1 reset 后 CPU HIT → 输出 exact match（§28 zipf + §19）
+
+## 13. 长时间压力测试
+
+`test_stress`（§二十七）：capacity ∈ {64, 128, 256} × ops ∈ {500, 1000, 5000}，固定 random seed，工作负载含热/冷/新 prefix。
+
+每 50 ops 检查不变量，每 200 ops 抽样 bit-exact（Load 到新 MLU block 校验）。
+
+**结果**：9 组全部 PASS，`leaks=0`，`bit-exact 抽样无失败`，最终 invariant ok。
+
+代表性（cap=256 ops=5000）：lookups=38397, hits=6570, stores=6212, evictions=5956, occ=1.0。
+
+不变量持续成立：`used + free == capacity`、`len(index) == used`、index value 无重复 cpu_block_id。
+
+## 14. Zipf-like workload
+
+20 个 prefix（P0 最热…P19 最冷），每个 4 blocks，cap=40（容纳 10 个）。Store 顺序冷到热（P19 先…P0 后），之后按 Zipf 概率 lookup 2000 次。
+
+**关键设计**：Store 冷到热使 SKIP 锁定最先存的 10 个 = P19..P10（最冷），后到的 P0..P9（最热）永远进不来；LRU 则淘汰最冷换入热前缀。
+
+| cap | LRU hit_rate | SKIP hit_rate | LRU evict | SKIP evict |
+|---|---|---|---|---|
+| 40 | 0.731 | 0.269 | 40 | 0 |
+| 64 | 0.949 | 0.658 | 16 | 0 |
+| 128 | 1.000 | 1.000 | 0 | 0 |
+| 256 | 1.000 | 1.000 | 0 | 0 |
+
+cap=40（容量受限）时 LRU hit_rate 0.731 vs SKIP 0.269 —— **LRU 持续吸收热前缀，SKIP 满后永久停止学习**。cap≥128 时容量足够容纳全部 20 prefix，两者持平。
+
+## 15. Hit Rate / Eviction / Occupancy
+
+- **Hit rate**：容量受限（cap=40）时 LRU 0.731 显著高于 SKIP 0.269；容量充足时两者 1.0。
+- **Eviction**：LRU 在 cap=40 淘汰 40 块、cap=64 淘汰 16 块（持续吸收新数据）；SKIP 始终 0（满即停）。
+- **Occupancy**：容量受限时 LRU/SKIP 都 occ=1.0（满）；cap=128 时 occ=0.625（20 prefix×4=80 blocks < 128）。
+
+结论：**有限容量下 LRU 能持续吸收新 prefix 并保持高 hit rate，而 pool-full-skip 满后永久停止学习** —— 正是 §二十八目标。
+
+## 16. 性能开销
+LRU metadata 开销（纯 Python OrderedDict）：
+
+| 操作 | 耗时 |
+|---|---|
+| lookup + touch | 0.71 µs |
+| evict 1 block | 0.38 µs |
+| evict 64 blocks | 84.96 µs |
+
+远低于 KV Load 的 ms 级（4096 prefix Load ~25ms）。evict64 ~85µs 是 64 次 `pop_lru + cpu_pool.free` 的累计，仍 < 1ms。LRU metadata 不是瓶颈。
+
+## 17. 真实 TTFT 回归（§三十三）
+
+启用 admission（min_tokens=1024）+ prompt_only + LRU，cpu_blocks=1024，suffix=32，repeat=3 中位数：
+
+| prefix_len | cold_ttft | cpu_hit_lru_ttft | speedup |
+|---|---|---|---|
+| 1024 | 113.81ms | 89.77ms | 1.27x |
+| 2048 | 215.51ms | 94.04ms | 2.29x |
+| 4096 | 435.87ms | 107.78ms | 4.04x |
+
+对比第五步（无 LRU）4096 speedup 3.92x → 第六步（with LRU）4.04x。**启用 LRU 后单次 CPU HIT TTFT 不退化**（107.78ms vs 第五步 111.21ms，甚至略优，因 metrics/touch 开销 µs 级可忽略）。4096 CPU HIT 仍明显优于 Cold（4.04x）。
+
+## 18. 当前限制
+
+- **同步 Store**：Request 完成时同步 D2H（含分段），占用 decode 末步时间。未做 async（约束）。
+- **block-level LRU**：一个 hash 对应一个 CPU block，每 block 独立淘汰。未做 request/chain/segment-level LRU（约束）。
+- **无 refcount/pending**：CPU block 无引用计数，hash 去重保证不重复占块，但不支持多 seq 共享同一 CPU block 的安全释放。
+- **eviction 不回滚 victim**：eviction 后 store 失败时已淘汰的旧 victim 不恢复（§十三接受）。
+- **固定阈值 admission**：min_tokens 固定 1024，未做动态阈值。
+- **TP>1**：仅验证 TP=1。
+
+## 19. 是否可以进入 Async Store 阶段
+
+**可以**。第六步已建立进入 Async Store 所需的全部前置条件：
+
+1. ✅ 容量有界（LRU eviction + admission），CPU cache 可长期运行不泄漏
+2. ✅ Store/Load 路径稳定，失败安全 rollback
+3. ✅ metrics 可观测（命中率/淘汰/占用），async 阶段可对比同步基线
+4. ✅ prompt-only 已实现，async Store 只搬 prompt KV，数据量可控
+5. ✅ 不变量（used+free==capacity, len(index)==used, 无重复 cpu_block_id）持续成立，async 引入并发后可用同一不变量验证
+
+Async Store 的下一步：把 `_store_to_cpu` 的同步 D2H 移到 background worker，引入 `STORE_PENDING` 状态（Request 完成即返回，Store 异步进行），需处理 Store 完成前 victim eviction 的竞态。本步的 LRU + metrics + rollback 框架可直接复用。
+
+---
+## 十二个问题
+
+**Q1: 为什么当前需要 Admission Policy？**
+第五步 CPU cache 无界且无准入：短 prefix（低复用价值）也占 CPU block，池满后新 prefix 永远进不来。Admission 用 min_tokens 阈值过滤低价值缓存，把容量留给高价值长 prefix；同时配合 LRU eviction 让 cache 在容量有界下持续吸收新数据。
+
+**Q2: cpu_prefix_min_tokens 最终设多少？依据是什么？**
+1024 tokens。依据第五步 break-even 分析：512-token CPU HIT speedup 0.97x（噪声级），1024-token 1.29x（净收益转正）。min_tokens=1024 保证被准入的 prefix 都有正收益，且 1024=64×16 整数倍 block 无 partial 残留。
+
+**Q3: prompt-only 是否成功实现？如何确定 prompt/block 边界？**
+成功。`Sequence.num_prompt_tokens`（__init__ 记录 prompt token 数，decode 只增 num_tokens）可靠区分 prompt/decode。prompt full block 数 = `num_prompt_tokens // block_size`。Scheduler 传 `prompt_block_limit` 给 backend 截断。测试 §23 验证 prompt 2048+decode 256 只存 128 prompt blocks。
+
+**Q4: LRU 的 key/value 和顺序结构是什么？**
+`OrderedDict[block_hash, cpu_block_id]`。key=xxh64 chained block hash，value=cpu_block_id。LRU 端=first（iter 头，最久未用），MRU 端=last（iter 尾，最近 HIT）。新 insert 追加 last，HIT `move_to_end` 到 last，victim `pop_lru` 删 first。
+
+**Q5: CPU HIT 如何 touch LRU？**
+`match_prefix` 内每个真正命中的 hash 调 `move_to_end(h)` 移到 MRU 端。MISS 即 break，MISS 及其后不 touch。
+
+**Q6: Duplicate Store 是否 touch？为什么？**
+不 touch。`insert` 遇已存在 hash 时返回 `(False, existing)` 不 `move_to_end`。理由：cache 热度由真实读取/复用（lookup HIT）决定，重复写入不代表复用。测试 §21 验证 A/B/C 顺序不变。
+**Q7: Pool 满时如何选择和释放 victim？**
+`free < num_new` 时 `need_evict = num_new - free`，循环 `index.pop_lru()`（删 first/LRU）拿 `victim_cpu`，`cpu_pool.free([victim_cpu])` 归还。严格先删 metadata 再 free block（§十二）。
+
+**Q8: 如何保证 eviction 后不会出现 stale hash -> reused block？**
+`pop_lru` 先从 index 删除 victim_hash（metadata 清除），再 `cpu_pool.free` 归还 block。block 归还后可被 allocator 复用，但其旧 hash 已不在 index → lookup(victim_hash) 返回 None（MISS）。新 store 复用该 block 时 `insert(new_hash, reused_cpu)`，新 hash 指向它。无 stale：旧 hash 已删，无多 hash 指向同 block。测试 §12 验证。
+
+**Q9: Prefix 链中间 block 被淘汰后，Longest Prefix Lookup 是否正确停止？**
+是。`match_prefix` 顺序扫描，遇第一个 MISS（hash 不在 index）立即 break，不 sparse hit。中间块淘汰后该位置 MISS，后续块即使存在也不命中不 touch。测试 §25：A B C D 淘汰 B → query A B C D matched=1（只 A）。
+
+**Q10: 500/1000/5000 次压力测试是否出现 block leak / double free / stale mapping？**
+未出现。9 组（64/128/256 × 500/1000/5000）全部 `leaks=0`、`bit-exact 抽样无失败`、最终 invariant ok。`used+free==capacity`、`len(index)==used`、index value 无重复 cpu_block_id 持续成立。
+
+**Q11: LRU 相比 pool-full-skip，在容量受限 workload 下 hit rate 是否更高？**
+是。cap=40 时 LRU hit_rate 0.731 vs SKIP 0.269。LRU 淘汰冷块换入热前缀持续吸收新数据；SKIP 满后锁定最先存的冷块，热前缀永远进不来。cap≥128 容量充足时两者持平 1.0。
+
+**Q12: 当前是否可以进入下一阶段：Async Store + STORE_PENDING？**
+可以。容量有界（LRU+admission）、Store/Load 稳定可 rollback、metrics 可观测、prompt-only 数据量可控、不变量框架就绪 —— 进入 Async Store 的前置条件全部满足。
+
+---
+
+## 最终裁决
+
+### **A. PASS**
+理由：
+- Admission（min_tokens=1024）+ prompt-only + LRU eviction + metrics 全部正确实现。
+- 104/104 LRU admission 测试通过（基础 LRU、block 复用 bit-exact、duplicate 不 touch、admission、prompt-only、pool-full eviction、mid-chain eviction、stale mapping、evict+store-fail rollback、9 组压力、zipf、perf overhead）。
+- 长时间压力（64/128/256 × 500/1000/5000）无 block leak / double free / stale mapping，bit-exact 抽样全通过。
+- 容量受限下 LRU hit_rate 0.731 显著优于 SKIP 0.269，证明持续吸收新 prefix。
+- 全部回归通过：index 27/0、backend 57/0、layout_v2 190/0、scheduler 31/0。
+- 真实 CPU HIT 输出仍 exact match，启用 LRU 后 4096 TTFT speedup 4.04x（不退化，第五步 3.92x）。
+- LRU metadata 开销 µs 级（lookup 0.71µs, evict1 0.38µs），远低于 ms 级 KV Load。
+- 阶段约束严格遵守（无 async/LRU 之外的淘汰策略/refcount/worker/kernel/layout 改动）。
+- cpu_lru_admission_benchmark.csv + 本报告完整交付。
+- 可进入 Async Store 阶段。
