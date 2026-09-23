@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nano-vllm"
+version = "0.3.0"
+authors = [{ name = "Xingkai Yu" }]
+license = "MIT"
+license-files = ["LICENSE"]
+readme = "README.md"
+description = "a lightweight vLLM implementation built from scratch"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "torch>=2.4.0",
+    "transformers>=4.51.0",
+    "xxhash",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "triton>=3.0.0",
+    "flash-attn",
+]
+mlu = [
+    "torch==2.9.1",
+    "torch-mlu>=1.29.1",
+    "torch_mlu_ops>=1.8.1",
+    "triton>=3.2.0",
+]
+test = [
+    "pytest>=8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/GeeeekExplorer/nano-vllm"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nanovllm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "mlu: requires Cambricon MLU hardware and RUN_MLU_TESTS=1",
+]
